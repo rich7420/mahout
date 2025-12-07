@@ -29,9 +29,10 @@ impl Preprocessor {
     /// Checks:
     /// - Qubit count within practical limits (1-30)
     /// - Data availability
-    /// - Data length against state vector size
+    ///
+    /// Note: In Batch Processing, input data can be much larger than a single state vector.
+    /// The encoder will handle batch sizing.
     pub fn validate_input(host_data: &[f64], num_qubits: usize) -> Result<()> {
-        // Validate qubits (max 30 = 16GB GPU memory)
         if num_qubits == 0 {
             return Err(MahoutError::InvalidInput(
                 "Number of qubits must be at least 1".to_string()
@@ -43,19 +44,15 @@ impl Preprocessor {
             ));
         }
 
-        // Validate input data
         if host_data.is_empty() {
             return Err(MahoutError::InvalidInput(
                 "Input data cannot be empty".to_string()
             ));
         }
 
-        let state_len = 1 << num_qubits;
-        if host_data.len() > state_len {
-            return Err(MahoutError::InvalidInput(
-                format!("Input data length {} exceeds state vector size {}", host_data.len(), state_len)
-            ));
-        }
+        // REMOVED: Strict check for host_data.len() > state_len
+        // In Batch Processing, input data can be much larger than a single state vector.
+        // The encoder will handle batch sizing.
 
         Ok(())
     }

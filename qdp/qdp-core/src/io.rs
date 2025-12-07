@@ -22,7 +22,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, Float64Array, ListArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -204,6 +204,93 @@ pub fn read_parquet_to_arrow<P: AsRef<Path>>(path: P) -> Result<Vec<Float64Array
             .clone();
 
         arrays.push(float_array);
+    }
+
+    if arrays.is_empty() {
+        return Err(MahoutError::Io(
+            "Parquet file contains no data".to_string(),
+        ));
+    }
+
+    Ok(arrays)
+}
+
+/// Reads quantum data from a Parquet file with List<Float64> column.
+///
+/// This function handles Parquet files where each row contains a list of floats
+/// (e.g., feature vectors). Each list element becomes a separate Float64Array.
+///
+/// # Arguments
+/// * `path` - Path to the Parquet file
+///
+/// # Returns
+/// Vector of Float64Arrays, one per row in the Parquet file
+pub fn read_parquet_list_to_arrow<P: AsRef<Path>>(path: P) -> Result<Vec<Float64Array>> {
+    let file = File::open(path.as_ref()).map_err(|e| {
+        MahoutError::Io(format!("Failed to open Parquet file: {}", e))
+    })?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        MahoutError::Io(format!("Failed to create Parquet reader: {}", e))
+    })?;
+
+    let mut reader = builder.build().map_err(|e| {
+        MahoutError::Io(format!("Failed to build Parquet reader: {}", e))
+    })?;
+
+    let mut arrays = Vec::new();
+
+    while let Some(batch_result) = reader.next() {
+        let batch = batch_result.map_err(|e| {
+            MahoutError::Io(format!("Failed to read Parquet batch: {}", e))
+        })?;
+
+        if batch.num_columns() == 0 {
+            return Err(MahoutError::Io(
+                "Parquet file has no columns".to_string(),
+            ));
+        }
+
+        let column = batch.column(0);
+
+        // Check if it's a List array
+        match column.data_type() {
+            DataType::List(_) | DataType::LargeList(_) => {
+                let list_array = column
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| {
+                        MahoutError::Io("Failed to downcast to ListArray".to_string())
+                    })?;
+
+                // Extract each list element as a Float64Array
+                // ListArray stores all values in a single child array
+                let child_array = list_array.values();
+                let float_array = child_array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        MahoutError::Io("List child array is not Float64Array".to_string())
+                    })?;
+
+                // Extract each row's list as a separate Float64Array
+                let offsets = list_array.value_offsets();
+                for i in 0..list_array.len() {
+                    if list_array.is_valid(i) {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        let slice = float_array.slice(start, end - start);
+                        arrays.push(slice);
+                    }
+                }
+            }
+            _ => {
+                return Err(MahoutError::Io(format!(
+                    "Expected List column, got {:?}",
+                    column.data_type()
+                )));
+            }
+        }
     }
 
     if arrays.is_empty() {

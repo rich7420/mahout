@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Async Pipeline Infrastructure
+// Async Pipeline Infrastructure (Generic)
 //
 // Provides generic double-buffered execution for large data processing.
 // Separates the "streaming mechanics" from the "kernel logic".
@@ -23,19 +23,20 @@ use std::sync::Arc;
 use std::ffi::c_void;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, safe::CudaStream};
 use crate::error::{MahoutError, Result};
+use crate::types::QuantumFloat;
 #[cfg(target_os = "linux")]
 use crate::gpu::memory::{ensure_device_memory_available, map_allocation_error};
 
-/// Chunk processing callback for async pipeline
+/// Chunk processing callback for async pipeline (generic)
 ///
 /// This closure is called for each chunk with:
 /// - `stream`: The CUDA stream to launch the kernel on
 /// - `input_ptr`: Device pointer to the chunk data (already copied)
 /// - `chunk_offset`: Global offset in the original data (in elements)
 /// - `chunk_len`: Length of this chunk (in elements)
-pub type ChunkProcessor = dyn FnMut(&CudaStream, *const f64, usize, usize) -> Result<()>;
+pub type ChunkProcessor<T> = dyn FnMut(&CudaStream, *const T, usize, usize) -> Result<()>;
 
-/// Executes a task using dual-stream double-buffering pattern
+/// Executes a task using dual-stream double-buffering pattern (Generic)
 ///
 /// This function handles the generic pipeline mechanics:
 /// - Dual stream creation and management
@@ -60,13 +61,14 @@ pub type ChunkProcessor = dyn FnMut(&CudaStream, *const f64, usize, usize) -> Re
 /// })?;
 /// ```
 #[cfg(target_os = "linux")]
-pub fn run_dual_stream_pipeline<F>(
+pub fn run_dual_stream_pipeline<T, F>(
     device: &Arc<CudaDevice>,
-    host_data: &[f64],
+    host_data: &[T],
     mut kernel_launcher: F,
 ) -> Result<()>
 where
-    F: FnMut(&CudaStream, *const f64, usize, usize) -> Result<()>,
+    T: QuantumFloat,
+    F: FnMut(&CudaStream, *const T, usize, usize) -> Result<()>,
 {
     crate::profile_scope!("GPU::AsyncPipeline");
 
@@ -80,26 +82,27 @@ where
     // 2. Chunk size: 8MB per chunk (balance between overhead and overlap opportunity)
     // TODO: we should tune this dynamically based on the detected GPU model or PCIe bandwidth in the future.
     // Too small = launch overhead dominates, too large = less overlap
-    const CHUNK_SIZE_ELEMENTS: usize = 8 * 1024 * 1024 / std::mem::size_of::<f64>(); // 8MB
+    const CHUNK_SIZE_BYTES: usize = 8 * 1024 * 1024; // 8MB
+    let chunk_size_elements = CHUNK_SIZE_BYTES / std::mem::size_of::<T>();
 
     // 3. Keep temporary buffers alive until all streams complete
     // This prevents Rust from dropping them while GPU is still using them
-    let mut keep_alive_buffers: Vec<CudaSlice<f64>> = Vec::new();
+    let mut keep_alive_buffers: Vec<CudaSlice<T>> = Vec::new();
 
     let mut global_offset = 0;
 
     // 4. Pipeline loop: alternate between streams for maximum overlap
-    for (chunk_idx, chunk) in host_data.chunks(CHUNK_SIZE_ELEMENTS).enumerate() {
+    for (chunk_idx, chunk) in host_data.chunks(chunk_size_elements).enumerate() {
         let current_stream = streams[chunk_idx % 2];
 
         crate::profile_scope!("GPU::ChunkProcess");
 
-        let chunk_bytes = chunk.len() * std::mem::size_of::<f64>();
+        let chunk_bytes = chunk.len() * std::mem::size_of::<T>();
         ensure_device_memory_available(chunk_bytes, "pipeline chunk buffer allocation", None)?;
 
-        // Allocate temporary device buffer for this chunk
+        // Allocate temporary device buffer for this chunk (T instead of f64)
         let input_chunk_dev = unsafe {
-            device.alloc::<f64>(chunk.len())
+            device.alloc::<T>(chunk.len())
         }.map_err(|e| map_allocation_error(
             chunk_bytes,
             "pipeline chunk buffer allocation",
@@ -124,7 +127,7 @@ where
 
                 let dst_device_ptr = *input_chunk_dev.device_ptr() as *mut c_void;
                 let src_host_ptr = chunk.as_ptr() as *const c_void;
-                let bytes = chunk.len() * std::mem::size_of::<f64>();
+                let bytes = chunk.len() * std::mem::size_of::<T>();
                 let stream_handle = current_stream.stream as *mut c_void;
 
                 // cudaMemcpyKind: cudaMemcpyHostToDevice = 1
@@ -147,7 +150,7 @@ where
         }
 
         // Get device pointer for kernel launch
-        let input_ptr = *input_chunk_dev.device_ptr() as *const f64;
+        let input_ptr = *input_chunk_dev.device_ptr() as *const T;
 
         // Invoke caller's kernel launcher (non-blocking)
         {

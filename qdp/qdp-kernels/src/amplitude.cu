@@ -18,7 +18,6 @@
 
 #include <cuda_runtime.h>
 #include <cuComplex.h>
-#include <vector_types.h>
 
 __global__ void amplitude_encode_kernel(
     const double* __restrict__ input,
@@ -38,21 +37,16 @@ __global__ void amplitude_encode_kernel(
     double v1 = 0.0;
     double v2 = 0.0;
 
-    // Vectorized Load Optimization:
-    // If we are well within bounds, treat input as double2 to issue a single 128-bit load instruction.
-    // This reduces memory transactions and improves throughput on RTX cards.
-    if (state_idx_base + 1 < input_len) {
-        // Reinterpret cast to load two doubles at once
-        // Note: Assumes input is reasonably aligned (standard cudaMalloc provides 256-byte alignment)
-        const double2* input_vec = reinterpret_cast<const double2*>(input);
-        double2 loaded = input_vec[idx];
-        v1 = loaded.x;
-        v2 = loaded.y;
-    }
-    // Handle edge case: Odd input length
-    else if (state_idx_base < input_len) {
+    // SAFE IMPLEMENTATION:
+    // Removed reinterpret_cast<double2*> to prevent CUDA_ERROR_ILLEGAL_ADDRESS
+    // caused by misaligned memory from Rust/Python (Vec<f64> is 8-byte aligned, double2 needs 16-byte).
+
+    if (state_idx_base < input_len) {
         v1 = input[state_idx_base];
-        // v2 remains 0.0
+    }
+
+    if (state_idx_base + 1 < input_len) {
+        v2 = input[state_idx_base + 1];
     }
 
     // Write output:

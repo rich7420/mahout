@@ -21,19 +21,21 @@ use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use crate::error::{MahoutError, Result};
 use crate::gpu::memory::GpuStateVector;
-use super::QuantumEncoder;
+use super::QuantumEncoderLegacy;
 
 /// Basis encoding (not implemented)
 /// TODO: Map integers to basis states (e.g., 3 → |011⟩)
 pub struct BasisEncoder;
 
-impl QuantumEncoder for BasisEncoder {
+// Legacy implementation for backward compatibility
+impl QuantumEncoderLegacy for BasisEncoder {
     fn encode(
         &self,
         _device: &Arc<CudaDevice>,
+        _pool: &Arc<crate::gpu::pool::StagingBufferPool>,
         _data: &[f64],
         _num_qubits: usize,
-    ) -> Result<GpuStateVector> {
+    ) -> Result<GpuStateVector<f64>> {
         Err(MahoutError::InvalidInput(
             "Basis encoding not yet implemented. Use 'amplitude' encoding for now.".to_string()
         ))

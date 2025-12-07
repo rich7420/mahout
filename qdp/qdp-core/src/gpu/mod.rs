@@ -15,9 +15,11 @@
 // limitations under the License.
 
 pub mod memory;
+pub mod pool;
 pub mod encodings;
 pub mod pipeline;
 
-pub use memory::GpuStateVector;
-pub use encodings::{QuantumEncoder, AmplitudeEncoder, AngleEncoder, BasisEncoder, get_encoder};
+pub use memory::{GpuStateVector, GpuBufferRaw};
+pub use pool::{GpuStackAllocator, StagingBufferPool};
+pub use encodings::{QuantumEncoder, AmplitudeEncoder, AngleEncoder, BasisEncoder, get_encoder, get_encoder_generic};
 pub use pipeline::run_dual_stream_pipeline;

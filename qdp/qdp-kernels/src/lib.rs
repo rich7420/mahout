@@ -20,6 +20,14 @@
 
 use std::ffi::c_void;
 
+// === 1. Single precision complex type ===
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuFloatComplex {
+    pub x: f32,
+    pub y: f32,
+}
+
 // Complex number (matches CUDA's cuDoubleComplex)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +35,13 @@ pub struct CuDoubleComplex {
     pub x: f64,  // Real part
     pub y: f64,  // Imaginary part
 }
+
+// === 2. Implement cudarc Traits ===
+#[cfg(target_os = "linux")]
+unsafe impl cudarc::driver::DeviceRepr for CuFloatComplex {}
+
+#[cfg(target_os = "linux")]
+unsafe impl cudarc::driver::ValidAsZeroBits for CuFloatComplex {}
 
 // Implement DeviceRepr for cudarc compatibility
 #[cfg(target_os = "linux")]
@@ -53,18 +68,68 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Launch batch amplitude encoding kernel (Float32)
+    pub fn launch_batch_encode_f32(
+        input: *const f32,
+        output: *mut c_void,
+        norms: *const f32,
+        batch_size: usize,
+        input_dim: usize,
+        state_dim: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Launch batch amplitude encoding kernel (Float64)
+    pub fn launch_batch_encode_f64(
+        input: *const f64,
+        output: *mut c_void,
+        norms: *const f64,
+        batch_size: usize,
+        input_dim: usize,
+        state_dim: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // TODO: launch_angle_encode, launch_basis_encode
 }
 
 // Dummy implementation for non-Linux (allows compilation)
 #[cfg(not(target_os = "linux"))]
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub extern "C" fn launch_amplitude_encode(
     _input_d: *const f64,
     _state_d: *mut c_void,
     _input_len: usize,
     _state_len: usize,
     _norm: f64,
+    _stream: *mut c_void,
+) -> i32 {
+    999 // Error: CUDA unavailable
+}
+
+#[cfg(not(target_os = "linux"))]
+#[no_mangle]
+pub extern "C" fn launch_batch_encode_f32(
+    _input: *const f32,
+    _output: *mut c_void,
+    _norms: *const f32,
+    _batch_size: usize,
+    _input_dim: usize,
+    _state_dim: usize,
+    _stream: *mut c_void,
+) -> i32 {
+    999 // Error: CUDA unavailable
+}
+
+#[cfg(not(target_os = "linux"))]
+#[no_mangle]
+pub extern "C" fn launch_batch_encode_f64(
+    _input: *const f64,
+    _output: *mut c_void,
+    _norms: *const f64,
+    _batch_size: usize,
+    _input_dim: usize,
+    _state_dim: usize,
     _stream: *mut c_void,
 ) -> i32 {
     999 // Error: CUDA unavailable

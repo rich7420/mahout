@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
-use qdp_kernels::CuDoubleComplex;
 use crate::error::{MahoutError, Result};
+use crate::types::QuantumFloat;
 
 #[cfg(target_os = "linux")]
 fn bytes_to_mib(bytes: usize) -> f64 {
@@ -130,58 +130,63 @@ pub(crate) fn map_allocation_error(
 
 /// RAII wrapper for GPU memory buffer
 /// Automatically frees GPU memory when dropped
-pub struct GpuBufferRaw {
-    pub(crate) slice: CudaSlice<CuDoubleComplex>,
+pub struct GpuBufferRaw<T: QuantumFloat> {
+    // Stores T::Complex, e.g., CuFloatComplex or CuDoubleComplex
+    pub(crate) slice: CudaSlice<T::Complex>,
 }
 
-impl GpuBufferRaw {
+impl<T: QuantumFloat> GpuBufferRaw<T> {
     /// Get raw pointer to GPU memory
     ///
     /// # Safety
     /// Valid only while GpuBufferRaw is alive
-    pub fn ptr(&self) -> *mut CuDoubleComplex {
-        *self.slice.device_ptr() as *mut CuDoubleComplex
+    pub fn ptr(&self) -> *mut T::Complex {
+        *self.slice.device_ptr() as *mut T::Complex
     }
 }
 
 /// Quantum state vector on GPU
 ///
-/// Manages complex128 array of size 2^n (n = qubits) in GPU memory.
+/// Manages complex array of size 2^n (n = qubits) in GPU memory.
 /// Uses Arc for shared ownership (needed for DLPack/PyTorch integration).
 /// Thread-safe: Send + Sync
-pub struct GpuStateVector {
+pub struct GpuStateVector<T: QuantumFloat> {
     // Use Arc to allow DLPack to share ownership
-    pub(crate) buffer: Arc<GpuBufferRaw>,
+    pub(crate) buffer: Arc<GpuBufferRaw<T>>,
     pub num_qubits: usize,
     pub size_elements: usize,
 }
 
 // Safety: CudaSlice and Arc are both Send + Sync
-unsafe impl Send for GpuStateVector {}
-unsafe impl Sync for GpuStateVector {}
+unsafe impl<T: QuantumFloat> Send for GpuStateVector<T> {}
+unsafe impl<T: QuantumFloat> Sync for GpuStateVector<T> {}
 
-impl GpuStateVector {
-    /// Create GPU state vector for n qubits
-    /// Allocates 2^n complex numbers on GPU (freed on drop)
-    pub fn new(_device: &Arc<CudaDevice>, qubits: usize) -> Result<Self> {
-        let _size_elements: usize = 1usize << qubits;
+impl<T: QuantumFloat> GpuStateVector<T> {
+    /// Create GPU state vector for n qubits (single vector)
+    pub fn new(device: &Arc<CudaDevice>, qubits: usize) -> Result<Self> {
+        let size_elements: usize = 1usize << qubits;
+        Self::new_with_capacity(device, qubits, size_elements)
+    }
 
+    /// Create GPU state vector with specific capacity (for Batch Processing)
+    ///
+    /// # Arguments
+    /// * `device` - CUDA device
+    /// * `qubits` - Number of qubits per vector (for metadata)
+    /// * `num_elements` - Total number of complex elements to allocate (e.g. Batch * 2^N)
+    pub fn new_with_capacity(device: &Arc<CudaDevice>, qubits: usize, num_elements: usize) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let requested_bytes = _size_elements
-                .checked_mul(std::mem::size_of::<CuDoubleComplex>())
+            let requested_bytes = num_elements
+                .checked_mul(std::mem::size_of::<T::Complex>())
                 .ok_or_else(|| MahoutError::MemoryAllocation(
-                    format!("Requested GPU allocation size overflow (elements={})", _size_elements)
+                    format!("Size overflow: {} elements", num_elements)
                 ))?;
 
-            // Pre-flight check to gracefully fail before cudaMalloc when OOM is obvious
             ensure_device_memory_available(requested_bytes, "state vector allocation", Some(qubits))?;
 
-            // Use uninitialized allocation to avoid memory bandwidth waste.
-            // TODO: Consider using a memory pool for input buffers to avoid repeated
-            // cudaMalloc overhead in high-frequency encode() calls.
             let slice = unsafe {
-                _device.alloc::<CuDoubleComplex>(_size_elements)
+                device.alloc::<T::Complex>(num_elements)
             }.map_err(|e| map_allocation_error(
                 requested_bytes,
                 "state vector allocation",
@@ -192,14 +197,13 @@ impl GpuStateVector {
             Ok(Self {
                 buffer: Arc::new(GpuBufferRaw { slice }),
                 num_qubits: qubits,
-                size_elements: _size_elements,
+                size_elements: num_elements,
             })
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            // Non-Linux: compiles but GPU unavailable
-            Err(MahoutError::Cuda("CUDA is only available on Linux. This build does not support GPU operations.".to_string()))
+            Err(MahoutError::Cuda("CUDA is only available on Linux.".to_string()))
         }
     }
 
@@ -207,7 +211,7 @@ impl GpuStateVector {
     ///
     /// # Safety
     /// Valid while GpuStateVector or any Arc clone is alive
-    pub fn ptr(&self) -> *mut CuDoubleComplex {
+    pub fn ptr(&self) -> *mut T::Complex {
         self.buffer.ptr()
     }
 

@@ -21,20 +21,21 @@ use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use crate::error::{MahoutError, Result};
 use crate::gpu::memory::GpuStateVector;
-use super::QuantumEncoder;
+use super::QuantumEncoderLegacy;
 
 /// Angle encoding (not implemented)
 /// TODO: Use sin/cos for rotation-based states
 pub struct AngleEncoder;
 
-impl QuantumEncoder for AngleEncoder {
+// Legacy implementation for backward compatibility
+impl QuantumEncoderLegacy for AngleEncoder {
     fn encode(
         &self,
         _device: &Arc<CudaDevice>,
-        data: &[f64],
-        num_qubits: usize,
-    ) -> Result<GpuStateVector> {
-        self.validate_input(data, num_qubits)?;
+        _pool: &Arc<crate::gpu::pool::StagingBufferPool>,
+        _data: &[f64],
+        _num_qubits: usize,
+    ) -> Result<GpuStateVector<f64>> {
         Err(MahoutError::InvalidInput(
             "Angle encoding not yet implemented. Use 'amplitude' encoding for now.".to_string()
         ))

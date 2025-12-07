@@ -19,6 +19,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use qdp_core::QdpEngine as CoreEngine;
 use qdp_core::dlpack::DLManagedTensor;
+use qdp_core::gpu::encodings::{AmplitudeEncoder, QuantumEncoder};
 
 /// Quantum tensor wrapper implementing DLPack protocol
 ///
@@ -125,12 +126,19 @@ impl Drop for QuantumTensor {
 unsafe impl Send for QuantumTensor {}
 unsafe impl Sync for QuantumTensor {}
 
+/// Wrapper Enum to hold either f32 or f64 engine
+enum EngineVariant {
+    F32(CoreEngine<f32>),
+    F64(CoreEngine<f64>),
+}
+
 /// PyO3 wrapper for QdpEngine
 ///
 /// Provides Python bindings for GPU-accelerated quantum state encoding.
+/// Now supports precision selection (float32 or float64).
 #[pyclass]
 struct QdpEngine {
-    engine: CoreEngine,
+    inner: EngineVariant,
 }
 
 #[pymethods]
@@ -139,18 +147,36 @@ impl QdpEngine {
     ///
     /// Args:
     ///     device_id: CUDA device ID (typically 0)
+    ///     precision: Floating-point precision ("float32", "f32", "float64", or "f64")
     ///
     /// Returns:
     ///     QdpEngine instance
     ///
     /// Raises:
-    ///     RuntimeError: If CUDA device initialization fails
+    ///     RuntimeError: If CUDA device initialization fails or precision is invalid
+    ///
+    /// Example:
+    ///     >>> engine = QdpEngine(0, precision="float32")  # Fast, half memory
+    ///     >>> engine = QdpEngine(0, precision="float64")  # High precision
     #[new]
-    #[pyo3(signature = (device_id=0))]
-    fn new(device_id: usize) -> PyResult<Self> {
-        let engine = CoreEngine::new(device_id)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize: {}", e)))?;
-        Ok(Self { engine })
+    #[pyo3(signature = (device_id=0, precision="float64"))]
+    fn new(device_id: usize, precision: &str) -> PyResult<Self> {
+        let variant = match precision {
+            "float32" | "f32" => {
+                let engine = CoreEngine::<f32>::new(device_id)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize: {}", e)))?;
+                EngineVariant::F32(engine)
+            },
+            "float64" | "f64" => {
+                let engine = CoreEngine::<f64>::new(device_id)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize: {}", e)))?;
+                EngineVariant::F64(engine)
+            },
+            _ => return Err(PyRuntimeError::new_err(
+                "Unsupported precision. Use 'float32' or 'float64'"
+            )),
+        };
+        Ok(Self { inner: variant })
     }
 
     /// Encode classical data into quantum state
@@ -173,8 +199,72 @@ impl QdpEngine {
     ///
     /// TODO: Use numpy array input (`PyReadonlyArray1<f64>`) for zero-copy instead of `Vec<f64>`.
     fn encode(&self, data: Vec<f64>, num_qubits: usize, encoding_method: &str) -> PyResult<QuantumTensor> {
-        let ptr = self.engine.encode(&data, num_qubits, encoding_method)
-            .map_err(|e| PyRuntimeError::new_err(format!("Encoding failed: {}", e)))?;
+        // For now, only support amplitude encoding with the new generic API
+        if encoding_method != "amplitude" {
+            return Err(PyRuntimeError::new_err(
+                format!("Only 'amplitude' encoding is supported with generic API. Got: {}", encoding_method)
+            ));
+        }
+
+        let ptr = match &self.inner {
+            EngineVariant::F64(engine) => {
+                // For now, use the legacy API which has pool integrated
+                // TODO: Expose pool access in QdpEngine
+                let ptr = engine.encode(&data, num_qubits, encoding_method)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encoding failed: {}", e)))?;
+                ptr
+            },
+            EngineVariant::F32(engine) => {
+                // Convert f64 data to f32
+                // Ideally input should be numpy array of f32 to avoid this conversion
+                let data_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+                let encoder = AmplitudeEncoder;
+                // Use the persistent pool from the engine (reused across calls)
+                let state = encoder.encode(engine.device(), engine.pool(), &data_f32, num_qubits)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encoding failed: {}", e)))?;
+                state.to_dlpack()
+            }
+        };
+
+        Ok(QuantumTensor {
+            ptr,
+            consumed: false,
+        })
+    }
+
+    /// Encode data directly from Parquet file (zero-copy Arrow path)
+    ///
+    /// This method reads Parquet chunks directly and encodes them without
+    /// intermediate Python list conversion, providing maximum performance.
+    ///
+    /// Args:
+    ///     path: Path to Parquet file
+    ///     num_qubits: Number of qubits for encoding
+    ///     encoding_method: Encoding strategy ("amplitude", "angle", or "basis")
+    ///
+    /// Returns:
+    ///     QuantumTensor: DLPack-compatible tensor for zero-copy PyTorch integration
+    ///
+    /// Raises:
+    ///     RuntimeError: If encoding fails
+    ///
+    /// Example:
+    ///     >>> engine = QdpEngine(device_id=0)
+    ///     >>> qtensor = engine.encode_from_parquet("data.parquet", num_qubits=10, encoding_method="amplitude")
+    ///     >>> torch_tensor = torch.from_dlpack(qtensor)
+    fn encode_from_parquet(&self, path: &str, num_qubits: usize, encoding_method: &str) -> PyResult<QuantumTensor> {
+        let ptr = match &self.inner {
+            EngineVariant::F64(engine) => {
+                engine.encode_from_parquet(path, num_qubits, encoding_method)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encoding from parquet failed: {}", e)))?
+            },
+            EngineVariant::F32(engine) => {
+                // This now calls the generic implementation which handles Arrow->f32 conversion internally
+                engine.encode_from_parquet(path, num_qubits, encoding_method)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encoding from parquet failed: {}", e)))?
+            }
+        };
+
         Ok(QuantumTensor {
             ptr,
             consumed: false,
