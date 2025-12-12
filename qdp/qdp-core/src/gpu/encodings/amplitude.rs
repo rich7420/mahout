@@ -31,9 +31,8 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 #[cfg(target_os = "linux")]
 use qdp_kernels::{
     launch_amplitude_encode,
-    launch_amplitude_encode_batch,
+    launch_amplitude_encode_with_norm_batch,
     launch_l2_norm,
-    launch_l2_norm_batch,
 };
 #[cfg(target_os = "linux")]
 use crate::gpu::memory::{ensure_device_memory_available, map_allocation_error};
@@ -184,54 +183,13 @@ impl QuantumEncoder for AmplitudeEncoder {
                 ))?
         };
 
-        // Compute inverse norms on GPU using warp-reduced kernel
-        let inv_norms_gpu = {
-            crate::profile_scope!("GPU::BatchNormKernel");
-            let mut buffer = device.alloc_zeros::<f64>(num_samples)
-                .map_err(|e| MahoutError::MemoryAllocation(
-                    format!("Failed to allocate norm buffer: {:?}", e)
-                ))?;
-
-            let ret = unsafe {
-                launch_l2_norm_batch(
-                    *input_batch_gpu.device_ptr() as *const f64,
-                    num_samples,
-                    sample_size,
-                    *buffer.device_ptr_mut() as *mut f64,
-                    std::ptr::null_mut(), // default stream
-                )
-            };
-
-            if ret != 0 {
-                return Err(MahoutError::KernelLaunch(
-                    format!("Norm reduction kernel failed: {} ({})", ret, cuda_error_to_string(ret))
-                ));
-            }
-
-            buffer
-        };
-
-        // Validate norms on host to catch zero or NaN samples early
+        // Launch fused kernel: norm computation and encoding in a single pass
         {
-            crate::profile_scope!("GPU::NormValidation");
-            let host_inv_norms = device.dtoh_sync_copy(&inv_norms_gpu)
-                .map_err(|e| MahoutError::Cuda(format!("Failed to copy norms to host: {:?}", e)))?;
-
-            if host_inv_norms.iter().any(|v| !v.is_finite() || *v == 0.0) {
-                return Err(MahoutError::InvalidInput(
-                    "One or more samples have zero or invalid norm".to_string()
-                ));
-            }
-        }
-
-        // Launch batch kernel
-        {
-            crate::profile_scope!("GPU::BatchKernelLaunch");
+            crate::profile_scope!("GPU::FusedNormEncodeBatch");
             let ret = unsafe {
-                launch_amplitude_encode_batch(
+                launch_amplitude_encode_with_norm_batch(
                     *input_batch_gpu.device_ptr() as *const f64,
                     batch_state_vector.ptr() as *mut c_void,
-                    *inv_norms_gpu.device_ptr() as *const f64,
                     num_samples,
                     sample_size,
                     state_len,
@@ -241,7 +199,7 @@ impl QuantumEncoder for AmplitudeEncoder {
 
             if ret != 0 {
                 return Err(MahoutError::KernelLaunch(
-                    format!("Batch kernel launch failed: {} ({})", ret, cuda_error_to_string(ret))
+                    format!("Fused norm+encode kernel failed: {} ({})", ret, cuda_error_to_string(ret))
                 ));
             }
         }

@@ -93,6 +93,20 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Launch fused kernel: compute L2 norm and encode in a single pass.
+    /// Returns CUDA error code (0 = success).
+    ///
+    /// # Safety
+    /// Pointers must reference valid device memory on the provided stream.
+    pub fn launch_amplitude_encode_with_norm_batch(
+        input_batch_d: *const f64,
+        state_batch_d: *mut c_void,
+        num_samples: usize,
+        input_len: usize,
+        state_len: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // TODO: launch_angle_encode, launch_basis_encode
 }
 
@@ -128,6 +142,19 @@ pub extern "C" fn launch_l2_norm_batch(
     _num_samples: usize,
     _sample_len: usize,
     _inv_norms_out_d: *mut f64,
+    _stream: *mut c_void,
+) -> i32 {
+    999
+}
+
+#[cfg(not(target_os = "linux"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn launch_amplitude_encode_with_norm_batch(
+    _input_batch_d: *const f64,
+    _state_batch_d: *mut c_void,
+    _num_samples: usize,
+    _input_len: usize,
+    _state_len: usize,
     _stream: *mut c_void,
 ) -> i32 {
     999

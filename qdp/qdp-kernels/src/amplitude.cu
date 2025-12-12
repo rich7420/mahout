@@ -454,6 +454,119 @@ int launch_l2_norm_batch(
     return (int)cudaGetLastError();
 }
 
+/// Fused kernel: compute L2 norm and encode in a single pass.
+///
+/// Eliminates kernel launch overhead, global memory traffic for norms, and GPU idle time.
+/// Each block processes one sample: compute norm in shared memory, then encode.
+__global__ void amplitude_encode_with_norm_batch_kernel(
+    const double* __restrict__ input_batch,
+    cuDoubleComplex* __restrict__ state_batch,
+    size_t num_samples,
+    size_t input_len,
+    size_t state_len
+) {
+    const size_t sample_idx = blockIdx.x;
+    if (sample_idx >= num_samples) return;
+
+    __shared__ double shared_inv_norm;
+
+    const size_t input_base = sample_idx * input_len;
+    const size_t state_base = sample_idx * state_len;
+
+    // Phase 1: Compute L2 norm
+    double local_sum = 0.0;
+    const size_t thread_idx = threadIdx.x;
+    const size_t block_size = blockDim.x;
+    size_t vec_offset = thread_idx;
+    size_t offset = vec_offset * 2;
+    while (offset + 1 < input_len) {
+        const double2 v = __ldg(reinterpret_cast<const double2*>(input_batch + input_base) + vec_offset);
+        local_sum += v.x * v.x + v.y * v.y;
+        vec_offset += block_size;
+        offset = vec_offset * 2;
+    }
+
+    if (offset < input_len) {
+        const double v = __ldg(input_batch + input_base + offset);
+        local_sum += v * v;
+    }
+
+    const double block_sum = block_reduce_sum(local_sum);
+
+    if (thread_idx == 0) {
+        double norm_sq = block_sum;
+        shared_inv_norm = (norm_sq > 0.0 && isfinite(norm_sq)) ? rsqrt(norm_sq) : 0.0;
+    }
+
+    __syncthreads();
+
+    // Phase 2: Encode using norm from shared memory
+    const size_t elements_per_sample = state_len / 2;
+    const size_t total_work = elements_per_sample;
+    const size_t stride = block_size;
+
+    for (size_t idx = thread_idx; idx < total_work; idx += stride) {
+        const size_t elem_pair = idx;
+        const size_t elem_offset = elem_pair * 2;
+
+        const double inv_norm = shared_inv_norm;
+
+        double v1, v2;
+        if (elem_offset + 1 < input_len) {
+            const double2 vec_data = __ldg(reinterpret_cast<const double2*>(input_batch + input_base) + elem_pair);
+            v1 = vec_data.x;
+            v2 = vec_data.y;
+        } else if (elem_offset < input_len) {
+            v1 = __ldg(input_batch + input_base + elem_offset);
+            v2 = 0.0;
+        } else {
+            v1 = v2 = 0.0;
+        }
+
+        const cuDoubleComplex c1 = make_cuDoubleComplex(v1 * inv_norm, 0.0);
+        const cuDoubleComplex c2 = make_cuDoubleComplex(v2 * inv_norm, 0.0);
+        state_batch[state_base + elem_offset] = c1;
+        if (elem_offset + 1 < state_len) {
+            state_batch[state_base + elem_offset + 1] = c2;
+        }
+    }
+}
+
+/// Launch fused kernel: compute L2 norm and encode in a single pass.
+/// Eliminates norm buffer allocation and separate kernel launches.
+int launch_amplitude_encode_with_norm_batch(
+    const double* input_batch_d,
+    void* state_batch_d,
+    size_t num_samples,
+    size_t input_len,
+    size_t state_len,
+    cudaStream_t stream
+) {
+    if (num_samples == 0 || state_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    cuDoubleComplex* state_complex_d = static_cast<cuDoubleComplex*>(state_batch_d);
+
+    const int blockSize = 256;
+    const size_t gridSize = num_samples;
+    const size_t max_grid = 65535;
+
+    if (gridSize > max_grid) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    amplitude_encode_with_norm_batch_kernel<<<gridSize, blockSize, 0, stream>>>(
+        input_batch_d,
+        state_complex_d,
+        num_samples,
+        input_len,
+        state_len
+    );
+
+    return (int)cudaGetLastError();
+}
+
 // TODO: Future encoding methods:
 // - launch_angle_encode (angle encoding)
 // - launch_basis_encode (basis encoding)
