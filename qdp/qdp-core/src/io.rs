@@ -475,7 +475,8 @@ impl ParquetBlockReader {
         }
 
         let field = &schema.fields()[0];
-        match field.data_type() {
+        // Try to extract sample_size from schema for FixedSizeList (avoids reading first batch)
+        let initial_sample_size = match field.data_type() {
             DataType::List(child_field) => {
                 if !matches!(child_field.data_type(), DataType::Float64) {
                     return Err(MahoutError::InvalidInput(format!(
@@ -483,14 +484,16 @@ impl ParquetBlockReader {
                         child_field.data_type()
                     )));
                 }
+                None // List type requires reading first batch to determine sample_size
             }
-            DataType::FixedSizeList(child_field, _) => {
+            DataType::FixedSizeList(child_field, size) => {
                 if !matches!(child_field.data_type(), DataType::Float64) {
                     return Err(MahoutError::InvalidInput(format!(
                         "Expected FixedSizeList<Float64> column, got FixedSizeList<{:?}>",
                         child_field.data_type()
                     )));
                 }
+                Some(*size as usize) // FixedSizeList: sample_size is in schema
             }
             _ => {
                 return Err(MahoutError::InvalidInput(format!(
@@ -498,7 +501,7 @@ impl ParquetBlockReader {
                     field.data_type()
                 )));
             }
-        }
+        };
 
         let total_rows = builder.metadata().file_metadata().num_rows() as usize;
 
@@ -512,7 +515,7 @@ impl ParquetBlockReader {
 
         Ok(Self {
             reader,
-            sample_size: None,
+            sample_size: initial_sample_size,
             leftover_data: Vec::new(),
             leftover_cursor: 0,
             total_rows,
@@ -572,7 +575,7 @@ impl ParquetBlockReader {
                     }
                     let column = batch.column(0);
 
-                    let (current_sample_size, batch_values) = match column.data_type() {
+                    let (current_sample_size, batch_values, should_break) = match column.data_type() {
                         DataType::List(_) => {
                             let list_array = column
                                 .as_any()
@@ -583,27 +586,91 @@ impl ParquetBlockReader {
                                 continue;
                             }
 
-                            let mut batch_values = Vec::new();
-                            let mut current_sample_size = None;
-                            for i in 0..list_array.len() {
-                                let value_array = list_array.value(i);
-                                let float_array = value_array
-                                    .as_any()
-                                    .downcast_ref::<Float64Array>()
-                                    .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
+                            // Optimized List processing: single pass when possible
+                            // First, get the values array to check if we can use fast-path
+                            let values = list_array.values();
+                            let values_float_array = values
+                                .as_any()
+                                .downcast_ref::<Float64Array>()
+                                .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
 
-                                if i == 0 {
-                                    current_sample_size = Some(float_array.len());
-                                }
-
-                                if float_array.null_count() == 0 {
-                                    batch_values.extend_from_slice(float_array.values());
-                                } else {
-                                    return Err(MahoutError::Io("Null value encountered in Float64Array during quantum encoding. Please check data quality at the source.".to_string()));
-                                }
+                            if values_float_array.null_count() != 0 {
+                                return Err(MahoutError::Io("Null value encountered in Float64Array during quantum encoding. Please check data quality at the source.".to_string()));
                             }
 
-                            (current_sample_size.expect("list_array.len() > 0 ensures at least one element"), batch_values)
+                            // Check first sample size
+                            let first_value = list_array.value(0);
+                            let first_float = first_value
+                                .as_any()
+                                .downcast_ref::<Float64Array>()
+                                .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
+
+                            let sample_size = first_float.len();
+                            let total_values_size = values_float_array.len();
+
+                            // Fast-path: Check if all samples have same size and values are contiguous
+                            // This is true if: values array size == list_array.len() * sample_size
+                            let expected_total_size = list_array.len() * sample_size;
+                            let is_fixed_size_contiguous = total_values_size == expected_total_size;
+
+                            let space_left = limit - written;
+
+                            if is_fixed_size_contiguous && total_values_size <= space_left {
+                                // Fast-path: All samples same size, values are contiguous
+                                buffer[written..written + total_values_size].copy_from_slice(values_float_array.values());
+                                written += total_values_size;
+                                (sample_size, Vec::new(), false)
+                            } else {
+                                // Slow-path: Need to iterate through samples
+                                // Pre-calculate total size
+                                let mut total_size = 0;
+                                let mut all_same_size = true;
+
+                                for i in 0..list_array.len() {
+                                    let value_array = list_array.value(i);
+                                    let float_array = value_array
+                                        .as_any()
+                                        .downcast_ref::<Float64Array>()
+                                        .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
+
+                                    if i > 0 && float_array.len() != sample_size {
+                                        all_same_size = false;
+                                    }
+
+                                    total_size += float_array.len();
+                                }
+
+                                let space_left = limit - written;
+                                if total_size <= space_left {
+                                    // All data fits, write directly to buffer
+                                    let mut offset = 0;
+                                    for i in 0..list_array.len() {
+                                        let value_array = list_array.value(i);
+                                        let float_array = value_array
+                                            .as_any()
+                                            .downcast_ref::<Float64Array>()
+                                            .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
+
+                                        let len = float_array.len();
+                                        buffer[written + offset..written + offset + len].copy_from_slice(float_array.values());
+                                        offset += len;
+                                    }
+                                    written += total_size;
+                                    (sample_size, Vec::new(), false)
+                                } else {
+                                    // Doesn't fit, need to collect (but pre-allocate)
+                                    let mut batch_values = Vec::with_capacity(total_size);
+                                    for i in 0..list_array.len() {
+                                        let value_array = list_array.value(i);
+                                        let float_array = value_array
+                                            .as_any()
+                                            .downcast_ref::<Float64Array>()
+                                            .ok_or_else(|| MahoutError::Io("List values must be Float64".to_string()))?;
+                                        batch_values.extend_from_slice(float_array.values());
+                                    }
+                                    (sample_size, batch_values, false)
+                                }
+                            }
                         }
                         DataType::FixedSizeList(_, size) => {
                             let list_array = column
@@ -623,14 +690,32 @@ impl ParquetBlockReader {
                                 .downcast_ref::<Float64Array>()
                                 .ok_or_else(|| MahoutError::Io("FixedSizeList values must be Float64".to_string()))?;
 
-                            let mut batch_values = Vec::new();
-                            if float_array.null_count() == 0 {
-                                batch_values.extend_from_slice(float_array.values());
-                            } else {
+                            if float_array.null_count() != 0 {
                                 return Err(MahoutError::Io("Null value encountered in Float64Array during quantum encoding. Please check data quality at the source.".to_string()));
                             }
 
-                            (current_sample_size, batch_values)
+                            // FixedSizeList has contiguous values - write directly to buffer
+                            let total_size = float_array.len();
+                            let space_left = limit - written;
+
+                            if total_size <= space_left {
+                                // All data fits, write directly
+                                buffer[written..written + total_size].copy_from_slice(float_array.values());
+                                written += total_size;
+                                (current_sample_size, Vec::new(), false) // Empty Vec since we wrote directly
+                            } else {
+                                // Partial write, save remainder
+                                if space_left > 0 {
+                                    buffer[written..written + space_left].copy_from_slice(&float_array.values()[0..space_left]);
+                                    written += space_left;
+                                }
+                                // Save remainder to leftover
+                                self.leftover_data.clear();
+                                self.leftover_data.extend_from_slice(&float_array.values()[space_left..]);
+                                self.leftover_cursor = 0;
+                                // Break here since we've filled the buffer and saved remainder
+                                (current_sample_size, Vec::new(), true) // Empty Vec, should break
+                            }
                         }
                         _ => {
                             return Err(MahoutError::Io(format!(
@@ -654,20 +739,28 @@ impl ParquetBlockReader {
                         }
                     }
 
-                    let available = batch_values.len();
-                    let space_left = limit - written;
+                    // Only process batch_values if it's not empty (i.e., we didn't write directly)
+                    if !batch_values.is_empty() {
+                        let available = batch_values.len();
+                        let space_left = limit - written;
 
-                    if available <= space_left {
-                        buffer[written..written+available].copy_from_slice(&batch_values);
-                        written += available;
-                    } else {
-                        if space_left > 0 {
-                            buffer[written..written+space_left].copy_from_slice(&batch_values[0..space_left]);
-                            written += space_left;
+                        if available <= space_left {
+                            buffer[written..written+available].copy_from_slice(&batch_values);
+                            written += available;
+                        } else {
+                            if space_left > 0 {
+                                buffer[written..written+space_left].copy_from_slice(&batch_values[0..space_left]);
+                                written += space_left;
+                            }
+                            self.leftover_data.clear();
+                            self.leftover_data.extend_from_slice(&batch_values[space_left..]);
+                            self.leftover_cursor = 0;
+                            break;
                         }
-                        self.leftover_data.clear();
-                        self.leftover_data.extend_from_slice(&batch_values[space_left..]);
-                        self.leftover_cursor = 0;
+                    }
+
+                    // Check if we should break (e.g., FixedSizeList partial write)
+                    if should_break {
                         break;
                     }
                 },

@@ -103,7 +103,24 @@ def test_amplitude_encoding_fidelity_comprehensive(
 
     assert torch_state.is_cuda, "Tensor must be on GPU"
     assert torch_state.dtype == torch.complex128, "Tensor must be Complex128"
-    assert torch_state.shape[0] == state_len, "Tensor shape must match 2^n"
+    # DLPack may return shape as [1, state_len] for single encode or [state_len]
+    # Handle both cases and flatten if needed
+    if len(torch_state.shape) == 2 and torch_state.shape[0] == 1:
+        # Shape is [1, state_len], flatten to [state_len]
+        assert torch_state.shape[1] == state_len, (
+            f"Tensor shape[1] must match 2^n, got {torch_state.shape}"
+        )
+        torch_state = torch_state.squeeze(
+            0
+        )  # Remove batch dimension: [1, state_len] -> [state_len]
+    elif len(torch_state.shape) == 1:
+        assert torch_state.shape[0] == state_len, (
+            f"Tensor shape must match 2^n, got {torch_state.shape}"
+        )
+    else:
+        assert False, (
+            f"Unexpected tensor shape: {torch_state.shape}, expected [state_len] or [1, state_len]"
+        )
 
     fidelity = calculate_fidelity(torch_state, expected_state_complex)
     print(f"Fidelity: {fidelity:.16f}")

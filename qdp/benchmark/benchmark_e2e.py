@@ -98,7 +98,7 @@ def generate_data(n_qubits, n_samples):
     table = pa.table(
         {"feature_vector": pa.array(feature_vectors, type=pa.list_(pa.float64()))}
     )
-    pq.write_table(table, DATA_FILE)
+    pq.write_table(table, DATA_FILE, compression="snappy", use_dictionary=False)
 
     # Save as Arrow IPC (FixedSizeList format for Mahout)
     arr = pa.FixedSizeListArray.from_arrays(pa.array(all_data.flatten()), dim)

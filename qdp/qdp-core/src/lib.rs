@@ -37,7 +37,7 @@ use cudarc::driver::{CudaDevice, DevicePtr, DevicePtrMut};
 use crate::dlpack::DLManagedTensor;
 use crate::gpu::get_encoder;
 #[cfg(target_os = "linux")]
-use crate::gpu::memory::{PinnedBuffer, GpuStateVector};
+use crate::gpu::memory::{PinnedHostBuffer, GpuStateVector};
 #[cfg(target_os = "linux")]
 use crate::gpu::PipelineContext;
 #[cfg(target_os = "linux")]
@@ -178,8 +178,45 @@ impl QdpEngine {
                 return Err(MahoutError::NotImplemented("Only amplitude encoding supported for streaming".into()));
             }
 
-            let mut reader_core = crate::io::ParquetBlockReader::new(path, None)?;
-            let num_samples = reader_core.total_rows;
+            // Try to determine sample_size and optimal batch_size
+            // For FixedSizeList, sample_size is in schema (no need to read first batch)
+            // For List, we need to read first batch, but we can optimize by using a small batch
+            let (num_samples, sample_size, optimal_batch_size) = {
+                // Create a temporary reader with minimal batch_size to check schema
+                let temp_reader = crate::io::ParquetBlockReader::new(path, Some(1))?;
+                let num_samples = temp_reader.total_rows;
+
+                // Try to get sample_size from schema (works for FixedSizeList)
+                if let Some(sample_size) = temp_reader.get_sample_size() {
+                    if sample_size == 0 {
+                        return Err(MahoutError::InvalidInput("Sample size cannot be zero".into()));
+                    }
+                    // Calculate optimal batch_size
+                    let max_rows_per_batch = STAGE_SIZE_ELEMENTS / sample_size;
+                    let optimal_batch_size = std::cmp::max(1024, std::cmp::min(max_rows_per_batch, 8192));
+                    (num_samples, sample_size, optimal_batch_size)
+                } else {
+                    // List type: need to read first batch to determine sample_size
+                    // Use a small buffer to minimize overhead
+                    let mut temp_reader = crate::io::ParquetBlockReader::new(path, Some(1))?;
+                    let mut temp_buffer = vec![0.0f64; std::cmp::min(STAGE_SIZE_ELEMENTS, 1024 * 1024)];
+                    let _ = temp_reader.read_chunk(&mut temp_buffer)?;
+                    let sample_size = temp_reader.get_sample_size()
+                        .ok_or_else(|| MahoutError::InvalidInput("Could not determine sample size".into()))?;
+
+                    if sample_size == 0 {
+                        return Err(MahoutError::InvalidInput("Sample size cannot be zero".into()));
+                    }
+
+                    // Calculate optimal batch_size
+                    let max_rows_per_batch = STAGE_SIZE_ELEMENTS / sample_size;
+                    let optimal_batch_size = std::cmp::max(1024, std::cmp::min(max_rows_per_batch, 8192));
+                    (num_samples, sample_size, optimal_batch_size)
+                }
+            };
+
+            // Create the actual reader with optimal batch_size
+            let mut reader_core = crate::io::ParquetBlockReader::new(path, Some(optimal_batch_size))?;
 
             let total_state_vector = GpuStateVector::new_batch(&self.device, num_samples, num_qubits)?;
             let ctx = PipelineContext::new(&self.device)?;
@@ -189,14 +226,11 @@ impl QdpEngine {
             let dev_in_b = unsafe { self.device.alloc::<f64>(STAGE_SIZE_ELEMENTS) }
                 .map_err(|e| MahoutError::MemoryAllocation(format!("{:?}", e)))?;
 
-            let (full_buf_tx, full_buf_rx): (SyncSender<std::result::Result<(PinnedBuffer, usize), MahoutError>>, Receiver<std::result::Result<(PinnedBuffer, usize), MahoutError>>) = sync_channel(2);
-            let (empty_buf_tx, empty_buf_rx): (SyncSender<PinnedBuffer>, Receiver<PinnedBuffer>) = sync_channel(2);
+            let (full_buf_tx, full_buf_rx): (SyncSender<std::result::Result<(PinnedHostBuffer, usize), MahoutError>>, Receiver<std::result::Result<(PinnedHostBuffer, usize), MahoutError>>) = sync_channel(2);
+            let (empty_buf_tx, empty_buf_rx): (SyncSender<PinnedHostBuffer>, Receiver<PinnedHostBuffer>) = sync_channel(2);
 
-            let mut host_buf_first = PinnedBuffer::new(STAGE_SIZE_ELEMENTS)?;
+            let mut host_buf_first = PinnedHostBuffer::new(STAGE_SIZE_ELEMENTS)?;
             let first_len = reader_core.read_chunk(host_buf_first.as_slice_mut())?;
-
-            let sample_size = reader_core.get_sample_size()
-                .ok_or_else(|| MahoutError::InvalidInput("Could not determine sample size".into()))?;
 
             if sample_size == 0 {
                 return Err(MahoutError::InvalidInput("Sample size cannot be zero".into()));
@@ -205,7 +239,7 @@ impl QdpEngine {
             full_buf_tx.send(Ok((host_buf_first, first_len)))
                 .map_err(|_| MahoutError::Io("Failed to send first buffer".into()))?;
 
-            empty_buf_tx.send(PinnedBuffer::new(STAGE_SIZE_ELEMENTS)?)
+            empty_buf_tx.send(PinnedHostBuffer::new(STAGE_SIZE_ELEMENTS)?)
                 .map_err(|_| MahoutError::Io("Failed to send second buffer".into()))?;
 
             let mut reader = reader_core;
@@ -256,9 +290,9 @@ impl QdpEngine {
                     unsafe {
                         crate::profile_scope!("GPU::Dispatch");
 
-                        ctx.async_copy_to_device(&host_buffer, dev_ptr as *mut c_void, current_len);
-                        ctx.record_copy_done();
-                        ctx.wait_for_copy();
+                        ctx.async_copy_to_device(host_buffer.ptr() as *const c_void, dev_ptr as *mut c_void, current_len)?;
+                        ctx.record_copy_done()?;
+                        ctx.wait_for_copy()?;
 
                         {
                             crate::profile_scope!("GPU::BatchEncode");
@@ -312,7 +346,7 @@ impl QdpEngine {
                             }
                         }
 
-                        ctx.sync_copy_stream();
+                        ctx.sync_copy_stream()?;
                     }
                     global_sample_offset = global_sample_offset
                         .checked_add(samples_in_chunk)
