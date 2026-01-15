@@ -152,6 +152,42 @@ fn is_pytorch_tensor(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(module_name == "torch")
 }
 
+/// Helper to detect TensorFlow tensors / variables (eager mode).
+///
+/// We intentionally keep this conservative to avoid false positives:
+/// - must come from a `tensorflow...` module
+/// - must expose a `.numpy()` method (eager conversion to NumPy)
+fn is_tensorflow_tensor(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let type_obj = obj.get_type();
+    let module = type_obj.module()?;
+    let module_name = module.to_str()?;
+    if !module_name.starts_with("tensorflow") {
+        return Ok(false);
+    }
+    obj.hasattr("numpy")
+}
+
+/// Validate TensorFlow tensor constraints for the current bindings.
+///
+/// Today the Python bindings ingest `f64` CPU memory slices (`&[f64]`) and
+/// then perform GPU encoding. For TensorFlow, we convert via `.numpy()`.
+fn validate_tensorflow_tensor(tensor: &Bound<'_, PyAny>) -> PyResult<()> {
+    // Prefer dtype.name when available (tf.DType has `.name` like "float64").
+    if tensor.hasattr("dtype")? {
+        let dtype = tensor.getattr("dtype")?;
+        if dtype.hasattr("name")? {
+            let dtype_name: String = dtype.getattr("name")?.extract()?;
+            if dtype_name != "float64" {
+                return Err(PyRuntimeError::new_err(format!(
+                    "TensorFlow tensor dtype must be float64 (try: tf.cast(x, tf.float64)). Got: {}",
+                    dtype_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Helper to validate tensor
 fn validate_tensor(tensor: &Bound<'_, PyAny>) -> PyResult<()> {
     if !is_pytorch_tensor(tensor)? {
@@ -218,6 +254,8 @@ impl QdpEngine {
     ///         - Python list: [1.0, 2.0, 3.0, 4.0]
     ///         - NumPy array: 1D (single sample) or 2D (batch) array
     ///         - PyTorch tensor: CPU float64 tensor (C-contiguous recommended; converted via NumPy view)
+    ///         - TensorFlow eager tensor / variable: float64 tensor (converted via `.numpy()`;
+    ///           GPU tensors will incur a device->host copy)
     ///         - String path: .parquet, .arrow, .npy file
     ///         - pathlib.Path: Path object (converted via os.fspath())
     ///     num_qubits: Number of qubits for encoding
@@ -256,8 +294,93 @@ impl QdpEngine {
             return self.encode_from_file(&path, num_qubits, encoding_method);
         }
 
-        // Check if it's a NumPy array
+        // Check if it's a NumPy array (most common case - check first for performance)
+        // NOTE: TensorFlow tensors may also have __array_interface__, so we check for TF
+        //       tensors within this block to handle them explicitly via .numpy()
         if data.hasattr("__array_interface__")? {
+            // Fast path: Check if it's a TensorFlow tensor first (before NumPy extraction)
+            // This avoids unnecessary NumPy extraction for TF tensors
+            if is_tensorflow_tensor(data)? {
+                validate_tensorflow_tensor(data)?;
+
+                // NOTE: `.numpy()` may trigger a device->host copy for GPU tensors.
+                let numpy_view = data.call_method0("numpy").map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "Failed to convert tensorflow object to NumPy. Ensure this is an eager Tensor/Variable \
+                         (not a symbolic/graph tensor).",
+                    )
+                })?;
+
+                let ndim: usize = numpy_view.getattr("ndim")?.extract()?;
+                let array = numpy_view
+                    .extract::<PyReadonlyArrayDyn<f64>>()
+                    .map_err(|_| {
+                        PyRuntimeError::new_err(
+                            "Failed to extract TensorFlow NumPy view as float64 array. Ensure dtype is float64 \
+                             (try: x = tf.cast(x, tf.float64)).",
+                        )
+                    })?;
+
+                let data_slice = array.as_slice().map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "TensorFlow -> NumPy result must be contiguous (C-order). \
+                         Try: x = np.ascontiguousarray(x.numpy(), dtype=np.float64).",
+                    )
+                })?;
+
+                match ndim {
+                    1 => {
+                        // 1D tensor: single sample encoding
+                        let ptr = self
+                            .engine
+                            .encode(data_slice, num_qubits, encoding_method)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("Encoding failed: {}", e))
+                            })?;
+                        return Ok(QuantumTensor {
+                            ptr,
+                            consumed: false,
+                        });
+                    }
+                    2 => {
+                        // 2D tensor: batch encoding
+                        let shape = array.shape();
+                        if shape.len() != 2 {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "Unsupported TensorFlow tensor shape: {}D. Expected 2D tensor (batch_size, features).",
+                                shape.len()
+                            )));
+                        }
+                        let num_samples = shape[0];
+                        let sample_size = shape[1];
+                        let ptr = self
+                            .engine
+                            .encode_batch(
+                                data_slice,
+                                num_samples,
+                                sample_size,
+                                num_qubits,
+                                encoding_method,
+                            )
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("Encoding failed: {}", e))
+                            })?;
+                        return Ok(QuantumTensor {
+                            ptr,
+                            consumed: false,
+                        });
+                    }
+                    _ => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "Unsupported TensorFlow tensor shape: {}D. Expected 1D tensor for single sample \
+                             encoding or 2D tensor (batch_size, features) for batch encoding.",
+                            ndim
+                        )));
+                    }
+                }
+            }
+
+            // Regular NumPy array path (most common case)
             // Get the array's ndim for shape validation
             let ndim: usize = data.getattr("ndim")?.extract()?;
 
@@ -415,7 +538,7 @@ impl QdpEngine {
         }
 
         Err(PyRuntimeError::new_err(
-            "Unsupported data type. Expected: list, NumPy array, PyTorch tensor, or file path",
+            "Unsupported data type. Expected: list, NumPy array, PyTorch tensor, TensorFlow tensor, or file path",
         ))
     }
 

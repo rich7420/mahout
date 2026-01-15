@@ -19,13 +19,17 @@
 
 import tempfile
 import os
+import pytest
 import numpy as np
 import torch
 from _qdp import QdpEngine
 
 
+@pytest.mark.gpu
 def test_encode_from_numpy_basic():
     """Test basic NumPy file encoding"""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required for QdpEngine")
     engine = QdpEngine(device_id=0)
 
     # Create test data
@@ -70,8 +74,11 @@ def test_encode_from_numpy_basic():
             os.remove(npy_path)
 
 
+@pytest.mark.gpu
 def test_encode_from_numpy_large():
     """Test NumPy encoding with larger dataset"""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required for QdpEngine")
     engine = QdpEngine(device_id=0)
 
     num_samples = 100
@@ -104,8 +111,11 @@ def test_encode_from_numpy_large():
             os.remove(npy_path)
 
 
+@pytest.mark.gpu
 def test_encode_from_numpy_single_sample():
     """Test NumPy encoding with single sample"""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required for QdpEngine")
     engine = QdpEngine(device_id=0)
 
     num_qubits = 4

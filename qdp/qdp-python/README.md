@@ -17,6 +17,18 @@ engine = QdpEngine(0)
 data = [0.5, 0.5, 0.5, 0.5]
 qtensor = engine.encode(data, num_qubits=2, encoding_method="amplitude")
 
+# Encode from TensorFlow eager tensors (CPU/GPU tensors are accepted, but GPU tensors will
+# incur a device->host copy when converting via `.numpy()`).
+#
+# NOTE: current bindings require float64 inputs for NumPy / PyTorch / TensorFlow paths.
+#       (Try: x = tf.cast(x, tf.float64))
+import tensorflow as tf
+import torch
+
+x = tf.constant([[1.0, 2.0, 3.0, 4.0]], dtype=tf.float64)
+qtensor = engine.encode(x, num_qubits=2, encoding_method="amplitude")
+torch_tensor = torch.from_dlpack(qtensor)
+
 # Or encode from file formats
 tensor_parquet = engine.encode("data.parquet", 10, "amplitude")
 tensor_arrow = engine.encode("data.arrow", 10, "amplitude")
