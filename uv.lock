@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10, <3.13"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -1977,11 +1977,15 @@ dev = [
 name = "qumat-qdp"
 source = { editable = "qdp/qdp-python" }
 dependencies = [
+    { name = "numpy" },
     { name = "qumat" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "qumat", editable = "." }]
+requires-dist = [
+    { name = "numpy", specifier = ">=1.24,<2.0" },
+    { name = "qumat", editable = "." },
+]
 
 [package.metadata.requires-dev]
 benchmark = [

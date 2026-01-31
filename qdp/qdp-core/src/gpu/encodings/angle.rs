@@ -256,6 +256,11 @@ impl AngleEncoder {
         num_qubits: usize,
         state_len: usize,
     ) -> Result<GpuStateVector> {
+        log::debug!(
+            "encode_batch_async_pipeline (angle): dual-stream pipeline (num_samples={}, sample_size={})",
+            num_samples,
+            sample_size
+        );
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
             GpuStateVector::new_batch(device, num_samples, num_qubits)?

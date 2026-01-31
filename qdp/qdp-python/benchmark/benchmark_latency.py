@@ -28,9 +28,10 @@ from __future__ import annotations
 import argparse
 import time
 
+import numpy as np
 import torch
 
-from _qdp import QdpEngine
+from qumat_qdp import QdpEngine
 from utils import normalize_batch, prefetched_batches
 
 BAR = "=" * 70
@@ -115,6 +116,61 @@ def run_mahout(
     duration = time.perf_counter() - start
     latency_ms = (duration / processed) * 1000 if processed > 0 else 0.0
     print(f"  Total Time: {duration:.4f} s ({latency_ms:.3f} ms/vector)")
+    return duration, latency_ms
+
+
+def run_mahout_coalesced(
+    num_qubits: int,
+    total_batches: int,
+    batch_size: int,
+    prefetch: int,
+    encoding_method: str = "amplitude",
+):
+    """Latency benchmark using encode_list (one FFI per chunk, pipeline + coalescing)."""
+    try:
+        engine = QdpEngine(0)
+    except Exception as exc:
+        print(f"[Mahout] Init failed: {exc}")
+        return 0.0, 0.0
+
+    vector_len = num_qubits if encoding_method == "angle" else (1 << num_qubits)
+    bytes_per_sample = vector_len * 8
+    chunk_samples = max(1, (64 * 1024 * 1024) // bytes_per_sample)
+
+    sync_cuda()
+    start = time.perf_counter()
+    processed = 0
+    chunk: list = []
+
+    for batch in prefetched_batches(
+        total_batches, batch_size, vector_len, prefetch, encoding_method
+    ):
+        normalized = normalize_batch(batch, encoding_method)
+        for i in range(normalized.shape[0]):
+            chunk.append(
+                np.ascontiguousarray(
+                    normalized[i : i + 1].reshape(-1), dtype=np.float64
+                )
+            )
+            if len(chunk) >= chunk_samples:
+                _qt, _bounds = engine.encode_list(
+                    chunk, vector_len, num_qubits, encoding_method
+                )
+                _ = torch.utils.dlpack.from_dlpack(_qt)
+                processed += len(chunk)
+                chunk = []
+
+    if chunk:
+        _qt, _bounds = engine.encode_list(
+            chunk, vector_len, num_qubits, encoding_method
+        )
+        _ = torch.utils.dlpack.from_dlpack(_qt)
+        processed += len(chunk)
+
+    sync_cuda()
+    duration = time.perf_counter() - start
+    latency_ms = (duration / processed) * 1000 if processed > 0 else 0.0
+    print(f"  [Coalesced] Total Time: {duration:.4f} s ({latency_ms:.3f} ms/vector)")
     return duration, latency_ms
 
 

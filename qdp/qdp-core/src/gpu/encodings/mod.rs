@@ -80,6 +80,37 @@ pub trait QuantumEncoder: Send + Sync {
         )))
     }
 
+    /// Encode batch via dual-stream pipeline (H2D/compute overlap).
+    ///
+    /// Callers (e.g. coalescer flush) should prefer this when data is already in a
+    /// contiguous buffer (e.g. Pinned) to use run_dual_stream_pipeline per §3.6.1.
+    /// Default implementation falls back to `encode_batch`.
+    ///
+    /// Ref: docs/optimization/REQUEST_COALESCING_REFERENCE_AND_DESIGN.md §3.6.1.
+    fn encode_batch_via_pipeline(
+        &self,
+        device: &Arc<CudaDevice>,
+        batch_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+    ) -> Result<GpuStateVector> {
+        self.encode_batch(device, batch_data, num_samples, sample_size, num_qubits)
+    }
+
+    /// Encode batch via pipeline when source is already pinned (no copy to pinned_slots, async H2D only).
+    /// Batch pool worker uses this after one copy (Vec → pinned). Default falls back to encode_batch_via_pipeline.
+    fn encode_batch_via_pipeline_from_pinned(
+        &self,
+        device: &Arc<CudaDevice>,
+        pinned_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+    ) -> Result<GpuStateVector> {
+        self.encode_batch_via_pipeline(device, pinned_data, num_samples, sample_size, num_qubits)
+    }
+
     /// Validate input data before encoding
     fn validate_input(&self, data: &[f64], num_qubits: usize) -> Result<()> {
         Preprocessor::validate_input(data, num_qubits)

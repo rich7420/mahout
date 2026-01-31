@@ -39,7 +39,7 @@ import gc
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.ipc as ipc
-from _qdp import QdpEngine
+from qumat_qdp import QdpEngine
 from utils import generate_batch_data, normalize_batch
 
 # Competitors

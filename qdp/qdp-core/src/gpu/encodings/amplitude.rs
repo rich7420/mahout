@@ -27,7 +27,10 @@ use super::QuantumEncoder;
 use crate::error::cuda_error_to_string;
 use crate::error::{MahoutError, Result};
 use crate::gpu::memory::GpuStateVector;
-use crate::gpu::pipeline::run_dual_stream_pipeline;
+use crate::gpu::pipeline::{
+    run_dual_stream_pipeline, run_dual_stream_pipeline_aligned,
+    run_dual_stream_pipeline_aligned_from_pinned,
+};
 use cudarc::driver::CudaDevice;
 
 #[cfg(target_os = "linux")]
@@ -37,9 +40,7 @@ use crate::gpu::memory::{ensure_device_memory_available, map_allocation_error};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 #[cfg(target_os = "linux")]
-use qdp_kernels::{
-    launch_amplitude_encode, launch_amplitude_encode_batch, launch_l2_norm, launch_l2_norm_batch,
-};
+use qdp_kernels::{launch_amplitude_encode, launch_amplitude_encode_batch_fused, launch_l2_norm};
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
 
@@ -183,7 +184,10 @@ impl QuantumEncoder for AmplitudeEncoder {
         }
     }
 
-    /// Encode multiple samples in a single GPU allocation and kernel launch
+    /// Encode multiple samples via single pipeline path (H2D/compute overlap).
+    ///
+    /// All batch sizes use encode_batch_via_pipeline; no separate sync path.
+    /// Ref: docs/optimization/QDP_OPTIMIZATION_PLAN_EN.md Part B (single pipeline, no branches).
     #[cfg(target_os = "linux")]
     fn encode_batch(
         &self,
@@ -193,106 +197,170 @@ impl QuantumEncoder for AmplitudeEncoder {
         sample_size: usize,
         num_qubits: usize,
     ) -> Result<GpuStateVector> {
-        crate::profile_scope!("AmplitudeEncoder::encode_batch");
+        self.encode_batch_via_pipeline(device, batch_data, num_samples, sample_size, num_qubits)
+    }
 
-        // Validate inputs using shared preprocessor
+    /// Batch encoding via dual-stream pipeline (H2D/compute overlap).
+    ///
+    /// Uses run_dual_stream_pipeline_aligned with chunk boundaries aligned to
+    /// sample_size so each chunk contains full samples. Per-chunk: L2 norm batch
+    /// then amplitude encode batch into the pre-allocated state at the correct offset.
+    ///
+    /// Ref: docs/optimization/REQUEST_COALESCING_REFERENCE_AND_DESIGN.md §3.6.1, §七之二 (encode_batch pipeline).
+    #[cfg(target_os = "linux")]
+    fn encode_batch_via_pipeline(
+        &self,
+        device: &Arc<CudaDevice>,
+        batch_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+    ) -> Result<GpuStateVector> {
+        crate::profile_scope!("AmplitudeEncoder::encode_batch_via_pipeline");
+        log::debug!(
+            "encode_batch_via_pipeline: dual-stream pipeline (num_samples={}, sample_size={})",
+            num_samples,
+            sample_size
+        );
+
         Preprocessor::validate_batch(batch_data, num_samples, sample_size, num_qubits)?;
 
         let state_len = 1 << num_qubits;
 
-        // Allocate single large GPU buffer for all states
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
             GpuStateVector::new_batch(device, num_samples, num_qubits)?
         };
 
-        // Upload input data to GPU
-        let input_batch_gpu = {
-            crate::profile_scope!("GPU::H2D_InputBatch");
-            device.htod_sync_copy(batch_data).map_err(|e| {
-                MahoutError::MemoryAllocation(format!("Failed to upload batch input: {:?}", e))
-            })?
+        let base_state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {
+            MahoutError::InvalidInput(
+                "Batch state vector precision mismatch (expected float64 buffer)".to_string(),
+            )
+        })?;
+
+        run_dual_stream_pipeline_aligned(
+            device,
+            batch_data,
+            sample_size,
+            |stream, input_ptr, chunk_offset, chunk_len| {
+                let first_sample = chunk_offset / sample_size;
+                let num_samples_chunk = chunk_len / sample_size;
+                if num_samples_chunk == 0 {
+                    return Ok(());
+                }
+
+                let stream_ptr = stream.stream as *mut c_void;
+
+                let state_chunk_ptr = unsafe {
+                    base_state_ptr
+                        .cast::<u8>()
+                        .add(
+                            first_sample
+                                * state_len
+                                * std::mem::size_of::<qdp_kernels::CuDoubleComplex>(),
+                        )
+                        .cast::<c_void>()
+                };
+
+                let ret = unsafe {
+                    launch_amplitude_encode_batch_fused(
+                        input_ptr,
+                        state_chunk_ptr,
+                        num_samples_chunk,
+                        sample_size,
+                        state_len,
+                        stream_ptr,
+                    )
+                };
+                if ret != 0 {
+                    return Err(MahoutError::KernelLaunch(format!(
+                        "Amplitude encode batch fused kernel failed in pipeline chunk: {} ({})",
+                        ret,
+                        cuda_error_to_string(ret)
+                    )));
+                }
+
+                Ok(())
+            },
+        )?;
+
+        Ok(batch_state_vector)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn encode_batch_via_pipeline(
+        &self,
+        device: &Arc<CudaDevice>,
+        batch_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+    ) -> Result<GpuStateVector> {
+        self.encode_batch(device, batch_data, num_samples, sample_size, num_qubits)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn encode_batch_via_pipeline_from_pinned(
+        &self,
+        device: &Arc<CudaDevice>,
+        pinned_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+    ) -> Result<GpuStateVector> {
+        Preprocessor::validate_batch(pinned_data, num_samples, sample_size, num_qubits)?;
+        let state_len = 1 << num_qubits;
+        let batch_state_vector = {
+            crate::profile_scope!("GPU::AllocBatch");
+            GpuStateVector::new_batch(device, num_samples, num_qubits)?
         };
+        let base_state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {
+            MahoutError::InvalidInput(
+                "Batch state vector precision mismatch (expected float64 buffer)".to_string(),
+            )
+        })?;
 
-        // Compute inverse norms on GPU using warp-reduced kernel
-        let inv_norms_gpu = {
-            crate::profile_scope!("GPU::BatchNormKernel");
-            let mut buffer = device.alloc_zeros::<f64>(num_samples).map_err(|e| {
-                MahoutError::MemoryAllocation(format!("Failed to allocate norm buffer: {:?}", e))
-            })?;
-
-            let ret = unsafe {
-                launch_l2_norm_batch(
-                    *input_batch_gpu.device_ptr() as *const f64,
-                    num_samples,
-                    sample_size,
-                    *buffer.device_ptr_mut() as *mut f64,
-                    std::ptr::null_mut(), // default stream
-                )
-            };
-
-            if ret != 0 {
-                return Err(MahoutError::KernelLaunch(format!(
-                    "Norm reduction kernel failed: {} ({})",
-                    ret,
-                    cuda_error_to_string(ret)
-                )));
-            }
-
-            buffer
-        };
-
-        // Validate norms on host to catch zero or NaN samples early
-        {
-            crate::profile_scope!("GPU::NormValidation");
-            let host_inv_norms = device
-                .dtoh_sync_copy(&inv_norms_gpu)
-                .map_err(|e| MahoutError::Cuda(format!("Failed to copy norms to host: {:?}", e)))?;
-
-            if host_inv_norms.iter().any(|v| !v.is_finite() || *v == 0.0) {
-                return Err(MahoutError::InvalidInput(
-                    "One or more samples have zero or invalid norm".to_string(),
-                ));
-            }
-        }
-
-        // Launch batch kernel
-        {
-            crate::profile_scope!("GPU::BatchKernelLaunch");
-            let state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {
-                MahoutError::InvalidInput(
-                    "Batch state vector precision mismatch (expected float64 buffer)".to_string(),
-                )
-            })?;
-            let ret = unsafe {
-                launch_amplitude_encode_batch(
-                    *input_batch_gpu.device_ptr() as *const f64,
-                    state_ptr as *mut c_void,
-                    *inv_norms_gpu.device_ptr() as *const f64,
-                    num_samples,
-                    sample_size,
-                    state_len,
-                    std::ptr::null_mut(), // default stream
-                )
-            };
-
-            if ret != 0 {
-                return Err(MahoutError::KernelLaunch(format!(
-                    "Batch kernel launch failed: {} ({})",
-                    ret,
-                    cuda_error_to_string(ret)
-                )));
-            }
-        }
-
-        // Synchronize
-        {
-            crate::profile_scope!("GPU::Synchronize");
-            device
-                .synchronize()
-                .map_err(|e| MahoutError::Cuda(format!("Sync failed: {:?}", e)))?;
-        }
-
+        run_dual_stream_pipeline_aligned_from_pinned(
+            device,
+            pinned_data,
+            sample_size,
+            |stream, input_ptr, chunk_offset, chunk_len| {
+                let first_sample = chunk_offset / sample_size;
+                let num_samples_chunk = chunk_len / sample_size;
+                if num_samples_chunk == 0 {
+                    return Ok(());
+                }
+                let stream_ptr = stream.stream as *mut c_void;
+                let state_chunk_ptr = unsafe {
+                    base_state_ptr
+                        .cast::<u8>()
+                        .add(
+                            first_sample
+                                * state_len
+                                * std::mem::size_of::<qdp_kernels::CuDoubleComplex>(),
+                        )
+                        .cast::<c_void>()
+                };
+                let ret = unsafe {
+                    launch_amplitude_encode_batch_fused(
+                        input_ptr,
+                        state_chunk_ptr,
+                        num_samples_chunk,
+                        sample_size,
+                        state_len,
+                        stream_ptr,
+                    )
+                };
+                if ret != 0 {
+                    return Err(MahoutError::KernelLaunch(format!(
+                        "Amplitude encode batch fused kernel failed in pipeline chunk: {} ({})",
+                        ret,
+                        cuda_error_to_string(ret)
+                    )));
+                }
+                Ok(())
+            },
+        )?;
         Ok(batch_state_vector)
     }
 

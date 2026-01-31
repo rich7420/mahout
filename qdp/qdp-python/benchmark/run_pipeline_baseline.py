@@ -40,6 +40,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -49,7 +50,10 @@ os.environ.setdefault("QDP_ENABLE_OVERLAP_TRACKING", "1")
 os.environ.setdefault("RUST_LOG", "info")
 
 from benchmark_latency import run_mahout as run_mahout_latency
+from benchmark_latency import run_mahout_coalesced as run_mahout_latency_coalesced
 from benchmark_throughput import run_mahout as run_mahout_throughput
+from benchmark_throughput import run_mahout_coalesced as run_mahout_throughput_coalesced
+from benchmark_throughput import run_mahout_stream as run_mahout_throughput_stream
 
 
 def _repo_root() -> Path:
@@ -175,6 +179,23 @@ def main() -> int:
         action="store_true",
         help="Skip latency trials.",
     )
+    parser.add_argument(
+        "--use-coalesced",
+        action="store_true",
+        help="Use encode_list (coalesced) instead of per-batch encode(); higher GPU/CPU utilization.",
+    )
+    parser.add_argument(
+        "--use-stream",
+        action="store_true",
+        help="Use encode_stream (async pipeline) for batch-level overlap; recommended for throughput (§五之零五點五).",
+    )
+    parser.add_argument(
+        "--in-flight",
+        type=int,
+        default=4,
+        metavar="N",
+        help="When --use-stream: max batches in flight before calling get() (default 4). Single master pool.",
+    )
     args = parser.parse_args()
 
     repo_root = _repo_root()
@@ -182,7 +203,12 @@ def main() -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     date_str = datetime.utcnow().strftime("%Y%m%d")
-    config_tag = "rep_config"
+    if args.use_stream:
+        config_tag = f"stream_inflight{args.in_flight}_rep_config"
+    elif args.use_coalesced:
+        config_tag = "coalesced_rep_config"
+    else:
+        config_tag = "rep_config"
     base_name = f"{args.output_prefix}_{date_str}_{config_tag}"
 
     commit = get_git_commit(repo_root)
@@ -192,32 +218,61 @@ def main() -> int:
     latencies_ms: list[float] = []
 
     if not args.skip_throughput:
+        run_throughput: Callable[..., tuple[float, float]]
+        if args.use_stream:
+            run_throughput = run_mahout_throughput_stream
+            run_throughput_kw = {"in_flight": args.in_flight}
+        elif args.use_coalesced:
+            run_throughput = run_mahout_throughput_coalesced
+            run_throughput_kw = {}
+        else:
+            run_throughput = run_mahout_throughput
+            run_throughput_kw = {}
+        mode_tag = (
+            f" [stream in_flight={args.in_flight}]"
+            if args.use_stream
+            else (" [coalesced]" if args.use_coalesced else "")
+        )
         print(
             f"Running throughput: {args.trials} trials (qubits={args.qubits}, batch_size={args.batch_size}, prefetch={args.prefetch}, batches={args.batches})"
+            + mode_tag
         )
-        throughputs = run_throughput_trials(
-            args.qubits,
-            args.batches,
-            args.batch_size,
-            args.prefetch,
-            args.trials,
-            args.encoding_method,
-        )
+        throughputs = []
+        for i in range(args.trials):
+            _duration, throughput = run_throughput(
+                args.qubits,
+                args.batches,
+                args.batch_size,
+                args.prefetch,
+                args.encoding_method,
+                **run_throughput_kw,
+            )
+            if throughput > 0:
+                throughputs.append(throughput)
         if throughputs:
             print(
                 f"  Throughput: median={np.median(throughputs):.1f} vec/s, p95={np.percentile(throughputs, 95):.1f} vec/s"
             )
 
     if not args.skip_latency:
-        print(f"Running latency: {args.trials} trials")
-        latencies_ms = run_latency_trials(
-            args.qubits,
-            args.batches,
-            args.batch_size,
-            args.prefetch,
-            args.trials,
-            args.encoding_method,
+        run_latency = (
+            run_mahout_latency_coalesced if args.use_coalesced else run_mahout_latency
         )
+        print(
+            f"Running latency: {args.trials} trials"
+            + (" [coalesced]" if args.use_coalesced else "")
+        )
+        latencies_ms = []
+        for i in range(args.trials):
+            _duration, latency_ms = run_latency(
+                args.qubits,
+                args.batches,
+                args.batch_size,
+                args.prefetch,
+                args.encoding_method,
+            )
+            if latency_ms > 0:
+                latencies_ms.append(latency_ms)
         if latencies_ms:
             print(
                 f"  Latency: median={np.median(latencies_ms):.3f} ms/vec, p95={np.percentile(latencies_ms, 95):.3f} ms/vec"
@@ -248,6 +303,12 @@ def main() -> int:
         f"- batches: {args.batches}",
         f"- trials: {args.trials}",
         f"- encoding: {args.encoding_method}",
+        f"- use_coalesced: {args.use_coalesced}",
+        f"- use_stream: {args.use_stream}",
+        f"- in_flight: {args.in_flight}",
+        "- warmup: 2 batches (stream path only)"
+        if args.use_stream
+        else "- warmup: none (normal/coalesced)",
         "",
         "## Results",
         "",

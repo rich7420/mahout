@@ -35,7 +35,11 @@ mod profiling;
 pub use error::{MahoutError, Result, cuda_error_to_string};
 pub use gpu::memory::Precision;
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 
 use crate::dlpack::DLManagedTensor;
 use crate::gpu::get_encoder;
@@ -48,6 +52,11 @@ use cudarc::driver::CudaDevice;
 pub struct QdpEngine {
     device: Arc<CudaDevice>,
     precision: Precision,
+    #[cfg(target_os = "linux")]
+    pub(crate) schedulers: Arc<Mutex<crate::gpu::SchedulerMap>>,
+    /// Default path for batch encode: N workers, each runs encode_batch_via_pipeline (no sync branch).
+    #[cfg(target_os = "linux")]
+    pub(crate) batch_pool: Arc<crate::gpu::BatchPool>,
 }
 
 impl QdpEngine {
@@ -60,6 +69,9 @@ impl QdpEngine {
     }
 
     /// Initialize engine with explicit precision.
+    ///
+    /// On Linux, creates a batch pool (single GPU master thread, bounded queue) so encode_batch
+    /// uses the pool by default (single path, no sync branch).
     pub fn new_with_precision(device_id: usize, precision: Precision) -> Result<Self> {
         let device = CudaDevice::new(device_id).map_err(|e| {
             MahoutError::Cuda(format!(
@@ -67,9 +79,19 @@ impl QdpEngine {
                 device_id, e
             ))
         })?;
+        #[cfg(target_os = "linux")]
+        let batch_pool = Arc::new(crate::gpu::BatchPool::new(
+            device.clone(),
+            precision,
+            crate::gpu::BatchPool::num_workers_from_env(),
+        ));
         Ok(Self {
             device, // CudaDevice::new already returns Arc<CudaDevice> in cudarc 0.11
             precision,
+            #[cfg(target_os = "linux")]
+            schedulers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            batch_pool,
         })
     }
 
@@ -124,6 +146,10 @@ impl QdpEngine {
     ///
     /// # Returns
     /// Single DLPack pointer containing all encoded states (shape: [num_samples, 2^num_qubits])
+    ///
+    /// Uses the batch pool by default (N workers, each runs encode_batch_via_pipeline).
+    /// Single path: no sync branch; pool keeps GPU fed (Triton/vLLM/DALI-style).
+    #[cfg(target_os = "linux")]
     pub fn encode_batch(
         &self,
         batch_data: &[f64],
@@ -133,19 +159,157 @@ impl QdpEngine {
         encoding_method: &str,
     ) -> Result<*mut DLManagedTensor> {
         crate::profile_scope!("Mahout::EncodeBatch");
+        self.batch_pool
+            .submit_handle(
+                crate::gpu::BatchJobData::Borrowed {
+                    ptr: batch_data.as_ptr(),
+                    len: batch_data.len(),
+                },
+                num_samples,
+                sample_size,
+                num_qubits,
+                encoding_method.to_string(),
+            )?
+            .get()
+    }
 
+    /// Same as encode_batch when not Linux (no pool).
+    #[cfg(not(target_os = "linux"))]
+    pub fn encode_batch(
+        &self,
+        batch_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> Result<*mut DLManagedTensor> {
+        crate::profile_scope!("Mahout::EncodeBatch");
         let encoder = get_encoder(encoding_method)?;
-        let state_vector = encoder.encode_batch(
+        let state_vector = encoder.encode_batch_via_pipeline(
             &self.device,
             batch_data,
             num_samples,
             sample_size,
             num_qubits,
         )?;
-
         let state_vector = state_vector.to_precision(&self.device, self.precision)?;
+        Ok(state_vector.to_dlpack())
+    }
+
+    /// Submit batch without blocking; returns handle. Call get() to receive DLPack. Use for encode_stream (submit many, get in order).
+    #[cfg(target_os = "linux")]
+    pub fn encode_batch_submit(
+        &self,
+        batch_data: &[f64],
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> Result<crate::gpu::BatchHandle> {
+        self.batch_pool.submit_handle(
+            crate::gpu::BatchJobData::Borrowed {
+                ptr: batch_data.as_ptr(),
+                len: batch_data.len(),
+            },
+            num_samples,
+            sample_size,
+            num_qubits,
+            encoding_method.to_string(),
+        )
+    }
+
+    /// Encode multiple slices in one coalesced batch (run_coalesced + pipeline).
+    ///
+    /// One FFI call: coalesces all slices into one Pinned buffer, runs
+    /// encode_batch_via_pipeline, returns merged batch DLPack and per-slice boundaries.
+    /// Reduces FFI and Python object overhead vs N separate encode() calls (§3.9, §3.11.2).
+    ///
+    /// Ref: docs/optimization/REQUEST_COALESCING_REFERENCE_AND_DESIGN.md §3.9 (encode_list), §3.11.2
+    ///
+    /// # Arguments
+    /// * `slices` - One slice per sample; each slice must have length `sample_size`
+    /// * `sample_size` - Number of f64 elements per sample
+    /// * `num_qubits` - Number of qubits
+    /// * `encoding_method` - Strategy: "amplitude", "angle", or "basis"
+    ///
+    /// # Returns
+    /// `(dlpack_ptr, boundaries)` where `boundaries` is `[(start_sample, num_samples); N]`
+    /// with one `(i, 1)` per slice in order.
+    pub fn encode_list(
+        &self,
+        slices: &[&[f64]],
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> Result<(*mut DLManagedTensor, Vec<(usize, usize)>)> {
+        crate::profile_scope!("Mahout::EncodeList");
+
+        let encoder = get_encoder(encoding_method)?;
+        let config = crate::gpu::CoalescerConfig::default();
+        let (batch_state, boundaries) = crate::gpu::encode_list(
+            &self.device,
+            encoder.as_ref(),
+            sample_size,
+            num_qubits,
+            config,
+            slices,
+        )?;
+        let state_vector = batch_state.to_precision(&self.device, self.precision)?;
         let dlpack_ptr = state_vector.to_dlpack();
-        Ok(dlpack_ptr)
+        Ok((dlpack_ptr, boundaries))
+    }
+
+    /// Submit encode task without blocking; returns a handle to retrieve result later (§3.9).
+    ///
+    /// Enables Dynamic Batching: submit multiple requests, then call `handle.get()` to receive
+    /// results in order. Scheduler coalesces tasks and runs pipeline once per batch.
+    ///
+    /// # Arguments
+    /// * `data` - Single sample (length must equal 2^num_qubits for amplitude encoding)
+    /// * `num_qubits` - Number of qubits
+    /// * `encoding_method` - "amplitude", "angle", or "basis"
+    ///
+    /// # Returns
+    /// `EncodeHandle`; call `.get()` to block and get DLPack pointer.
+    #[cfg(target_os = "linux")]
+    pub fn encode_async(
+        &self,
+        data: &[f64],
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> Result<crate::gpu::EncodeHandle> {
+        crate::profile_scope!("Mahout::EncodeAsync");
+
+        let sample_size = data.len();
+        get_encoder(encoding_method)?; // validate before taking lock
+        let key = (sample_size, num_qubits, encoding_method.to_string());
+        let mut guard = self.schedulers.lock().map_err(|e| {
+            MahoutError::InvalidInput(format!("encode_async: scheduler lock poisoned: {}", e))
+        })?;
+        let scheduler = guard.entry(key.clone()).or_insert_with(|| {
+            let encoder = get_encoder(&key.2).expect("encoding_method already validated");
+            crate::gpu::EncodeScheduler::new(
+                self.device.clone(),
+                encoder,
+                key.0,
+                key.1,
+                crate::gpu::SchedulerConfig::default(),
+            )
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = crate::gpu::EncodeTask {
+            data: data.to_vec(),
+            num_samples: 1,
+            sample_size,
+            tx,
+        };
+        scheduler.submit(task)?;
+        Ok(crate::gpu::EncodeHandle::new(
+            rx,
+            self.device.clone(),
+            self.precision,
+            num_qubits,
+        ))
     }
 
     /// Streaming Parquet encoder with multi-threaded IO

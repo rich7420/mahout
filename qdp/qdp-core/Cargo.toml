@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 cudarc = { workspace = true }
+# Ref: https://docs.rs/crossbeam-channel/0.5.15/ (§3.11.4 after/tick, bounded backpressure)
+crossbeam-channel = "0.5.15"
+# N.7: optional thread affinity on Linux (sched_setaffinity)
+libc = { version = "0.2", optional = true }
 qdp-kernels = { path = "../qdp-kernels" }
 thiserror = { workspace = true }
 rayon = { workspace = true }
@@ -29,6 +33,8 @@ name = "qdp_core"
 default = []
 observability = ["nvtx"]
 pytorch = ["tch"]
+# Enable N.7: pin batch pool master to one CPU when QDP_MASTER_CPU_ID is set (Linux)
+thread_affinity = ["libc"]
 
 [dev-dependencies]
 approx = "0.5.1"

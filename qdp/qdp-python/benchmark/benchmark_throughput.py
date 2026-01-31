@@ -33,7 +33,7 @@ import time
 import numpy as np
 import torch
 
-from _qdp import QdpEngine
+from qumat_qdp import QdpEngine, encode_stream
 from utils import normalize_batch, prefetched_batches
 
 BAR = "=" * 70
@@ -101,14 +101,128 @@ def run_mahout(
             normalize_batch(batch, encoding_method), dtype=np.float64
         )
         qtensor = engine.encode(normalized, num_qubits, encoding_method)
-        tensor = torch.from_dlpack(qtensor).abs().to(torch.float32)
-        _ = tensor.sum()
+        _ = torch.from_dlpack(qtensor).abs().to(torch.float32)
         processed += normalized.shape[0]
 
     torch.cuda.synchronize()
     duration = time.perf_counter() - start
     throughput = processed / duration if duration > 0 else 0.0
     print(f"  IO + Encode Time: {duration:.4f} s")
+    print(f"  Total Time: {duration:.4f} s ({throughput:.1f} vectors/sec)")
+    return duration, throughput
+
+
+def run_mahout_coalesced(
+    num_qubits: int,
+    total_batches: int,
+    batch_size: int,
+    prefetch: int,
+    encoding_method: str = "amplitude",
+):
+    """Throughput benchmark using encode_list (one FFI per chunk, pipeline + coalescing)."""
+    try:
+        engine = QdpEngine(0)
+    except Exception as exc:
+        print(f"[Mahout] Init failed: {exc}")
+        return 0.0, 0.0
+
+    if not hasattr(engine, "encode_list"):
+        raise AttributeError(
+            "QdpEngine has no attribute 'encode_list'. Rebuild the extension and use "
+            "the same env that will run the script. From qdp/qdp-python run: "
+            "python -m maturin develop --release (then run this script with that venv's "
+            "python, e.g. ../.venv/bin/python, so 'uv run' does not overwrite). "
+            "Or from repo root: uv run python qdp/qdp-python/benchmark/run_pipeline_baseline.py ..."
+        )
+
+    vector_len = num_qubits if encoding_method == "angle" else (1 << num_qubits)
+    # Chunk size to stay under CoalescerConfig max_batch_bytes (64 MB default)
+    bytes_per_sample = vector_len * 8
+    chunk_samples = max(1, (64 * 1024 * 1024) // bytes_per_sample)
+
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    processed = 0
+    chunk: list[np.ndarray] = []
+
+    for batch in prefetched_batches(
+        total_batches, batch_size, vector_len, prefetch, encoding_method
+    ):
+        normalized = np.ascontiguousarray(
+            normalize_batch(batch, encoding_method), dtype=np.float64
+        )
+        for i in range(normalized.shape[0]):
+            chunk.append(normalized[i : i + 1].reshape(-1).copy())
+            if len(chunk) >= chunk_samples:
+                _qt, _bounds = engine.encode_list(
+                    chunk, vector_len, num_qubits, encoding_method
+                )
+                _ = torch.from_dlpack(_qt).abs().to(torch.float32)
+                processed += len(chunk)
+                chunk = []
+
+    if chunk:
+        _qt, _bounds = engine.encode_list(
+            chunk, vector_len, num_qubits, encoding_method
+        )
+        _ = torch.from_dlpack(_qt).abs().to(torch.float32)
+        processed += len(chunk)
+
+    torch.cuda.synchronize()
+    duration = time.perf_counter() - start
+    throughput = processed / duration if duration > 0 else 0.0
+    print(f"  [Coalesced] IO + Encode Time: {duration:.4f} s")
+    print(f"  Total Time: {duration:.4f} s ({throughput:.1f} vectors/sec)")
+    return duration, throughput
+
+
+def run_mahout_stream(
+    num_qubits: int,
+    total_batches: int,
+    batch_size: int,
+    prefetch: int,
+    encoding_method: str = "amplitude",
+    in_flight: int = 4,
+):
+    """Throughput benchmark using encode_stream (async pipeline). On Linux uses Rust pool (encode_batch_submit) by default."""
+    try:
+        engine = QdpEngine(0)
+    except Exception as exc:
+        print(f"[Mahout] Init failed: {exc}")
+        return 0.0, 0.0
+
+    vector_len = num_qubits if encoding_method == "angle" else (1 << num_qubits)
+    stream_kw: dict = {"in_flight": in_flight}
+
+    # Warmup: same path, 2 batches (§5.11.1 #8, §5.11.9)
+    warmup_iter = prefetched_batches(
+        2, batch_size, vector_len, prefetch, encoding_method
+    )
+    for qt in encode_stream(
+        engine, warmup_iter, num_qubits, encoding_method, **stream_kw
+    ):
+        _ = torch.from_dlpack(qt).abs().to(torch.float32)
+    torch.cuda.synchronize()
+
+    batches_iter = prefetched_batches(
+        total_batches, batch_size, vector_len, prefetch, encoding_method
+    )
+    start = time.perf_counter()
+    processed = 0
+    for qtensor in encode_stream(
+        engine,
+        batches_iter,
+        num_qubits,
+        encoding_method,
+        **stream_kw,
+    ):
+        t = torch.from_dlpack(qtensor).abs().to(torch.float32)
+        processed += t.shape[0]
+
+    torch.cuda.synchronize()
+    duration = time.perf_counter() - start
+    throughput = processed / duration if duration > 0 else 0.0
+    print(f"  [Stream in_flight={in_flight}] IO + Encode Time: {duration:.4f} s")
     print(f"  Total Time: {duration:.4f} s ({throughput:.1f} vectors/sec)")
     return duration, throughput
 
@@ -139,8 +253,7 @@ def run_pennylane(num_qubits: int, total_batches: int, batch_size: int, prefetch
             state_cpu = circuit(batch_cpu)
         except Exception:
             state_cpu = torch.stack([circuit(x) for x in batch_cpu])
-        state_gpu = state_cpu.to("cuda", dtype=torch.float32)
-        _ = state_gpu.abs().sum()
+        _ = state_cpu.to("cuda", dtype=torch.float32)
         processed += len(batch_cpu)
 
     torch.cuda.synchronize()
@@ -175,10 +288,7 @@ def run_qiskit(num_qubits: int, total_batches: int, batch_size: int, prefetch: i
             batch_states.append(state)
             processed += 1
 
-        gpu_tensor = torch.tensor(
-            np.array(batch_states), device="cuda", dtype=torch.complex64
-        )
-        _ = gpu_tensor.abs().sum()
+        _ = torch.tensor(np.array(batch_states), device="cuda", dtype=torch.complex64)
 
     torch.cuda.synchronize()
     duration = time.perf_counter() - start

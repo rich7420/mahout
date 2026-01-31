@@ -14,12 +14,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::RefCell;
+
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
 use qdp_core::dlpack::DLManagedTensor;
+#[cfg(target_os = "linux")]
+use qdp_core::gpu::BatchHandle as CoreBatchHandle;
+#[cfg(target_os = "linux")]
+use qdp_core::gpu::EncodeHandle as CoreEncodeHandle;
 use qdp_core::{Precision, QdpEngine as CoreEngine};
+
+/// Result of coalesce batcher flush: (batch QuantumTensor, sample boundaries). Reduces type complexity.
+type CoalesceResult = (Py<QuantumTensor>, Vec<(usize, usize)>);
 
 /// Quantum tensor wrapper implementing DLPack protocol
 ///
@@ -139,6 +149,189 @@ impl Drop for QuantumTensor {
 // The DLManagedTensor pointer management is thread-safe via Arc in the deleter
 unsafe impl Send for QuantumTensor {}
 unsafe impl Sync for QuantumTensor {}
+
+/// Handle for deferred result of encode_async (§3.9). Call `.get()` to block and receive the tensor.
+#[cfg(target_os = "linux")]
+#[pyclass]
+struct EncodeHandle {
+    inner: Option<CoreEncodeHandle>,
+}
+
+#[cfg(target_os = "linux")]
+#[pymethods]
+impl EncodeHandle {
+    /// Block until the result is ready; returns the encoded QuantumTensor.
+    /// Preserves order: result corresponds to the request submitted with encode_async.
+    fn get(&mut self) -> PyResult<QuantumTensor> {
+        let inner = self.inner.take().ok_or_else(|| {
+            PyRuntimeError::new_err("EncodeHandle already consumed (get() can only be called once)")
+        })?;
+        let ptr = inner
+            .get()
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))?;
+        Ok(QuantumTensor {
+            ptr,
+            consumed: false,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for EncodeHandle {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for EncodeHandle {}
+
+/// Handle for non-blocking batch submit (Rust pool). Call `.get()` to block and receive QuantumTensor.
+#[cfg(target_os = "linux")]
+#[pyclass]
+struct BatchHandle {
+    inner: Option<CoreBatchHandle>,
+}
+
+#[cfg(target_os = "linux")]
+#[pymethods]
+impl BatchHandle {
+    /// Block until the batch result is ready; returns the encoded QuantumTensor.
+    fn get(&mut self) -> PyResult<QuantumTensor> {
+        let inner = self.inner.take().ok_or_else(|| {
+            PyRuntimeError::new_err("BatchHandle already consumed (get() can only be called once)")
+        })?;
+        let ptr = inner
+            .get()
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))?;
+        Ok(QuantumTensor {
+            ptr,
+            consumed: false,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for BatchHandle {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for BatchHandle {}
+
+/// Scope-based coalescing: collect submits in `with` block, flush on exit (§3.4, §3.6).
+///
+/// Use `with engine.coalesce(sample_size, num_qubits, encoding_method) as batcher:`
+/// then `batcher.submit(array)` / `batcher.submit_batch(...)`; on exit, flush runs
+/// (one copy to Pinned → run_dual_stream_pipeline) and result is in `batcher.get_result()`.
+#[pyclass(unsendable)]
+struct CoalesceBatcher {
+    engine: Py<PyAny>,
+    sample_size: usize,
+    num_qubits: usize,
+    encoding_method: String,
+    arrays: RefCell<Vec<Py<PyAny>>>,
+    result: RefCell<Option<CoalesceResult>>,
+}
+
+#[pymethods]
+impl CoalesceBatcher {
+    /// Context manager entry; returns self.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// On normal exit: flush (encode_list) and store (QuantumTensor, boundaries) in result.
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_val: &Bound<'_, PyAny>,
+        _exc_tb: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let arrays = self.arrays.borrow();
+        if arrays.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "coalesce: flush called with empty queue (no submit before exit)",
+            ));
+        }
+        let list = PyList::empty(py);
+        for arr in arrays.iter() {
+            list.append(arr.bind(py))?;
+        }
+        drop(arrays);
+        let engine = self
+            .engine
+            .bind(py)
+            .cast::<QdpEngine>()
+            .map_err(|_| PyRuntimeError::new_err("coalesce: engine type mismatch"))?;
+        let ret = engine.call_method1(
+            "encode_list",
+            (
+                list,
+                self.sample_size,
+                self.num_qubits,
+                self.encoding_method.as_str(),
+            ),
+        )?;
+        let item0 = ret.get_item(0)?;
+        let bound_batch = item0.cast::<QuantumTensor>()?;
+        let batch_py = bound_batch.clone().unbind();
+        let boundaries = ret.get_item(1)?.extract::<Vec<(usize, usize)>>()?;
+        *self.result.borrow_mut() = Some((batch_py, boundaries.clone()));
+        self.arrays.borrow_mut().clear();
+        Ok(false)
+    }
+
+    /// Submit one sample (1D float64 array of length sample_size).
+    fn submit(&self, _py: Python<'_>, array: &Bound<'_, PyAny>) -> PyResult<()> {
+        let arr = array.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
+            PyRuntimeError::new_err("coalesce.submit: argument must be 1D NumPy array (float64)")
+        })?;
+        if arr.len() != self.sample_size {
+            return Err(PyRuntimeError::new_err(format!(
+                "coalesce.submit: array length {} != sample_size {}",
+                arr.len(),
+                self.sample_size
+            )));
+        }
+        // Store Python reference: Bound -> Py<PyAny> via unbind (PyO3 0.27).
+        self.arrays.borrow_mut().push(array.clone().unbind());
+        Ok(())
+    }
+
+    /// Submit a batch (2D array: num_samples × sample_size); stores row views (no copy).
+    fn submit_batch(
+        &self,
+        _py: Python<'_>,
+        batch_data: &Bound<'_, PyAny>,
+        num_samples: usize,
+        sample_size: usize,
+    ) -> PyResult<()> {
+        if sample_size != self.sample_size {
+            return Err(PyRuntimeError::new_err(format!(
+                "coalesce.submit_batch: sample_size {} != batcher sample_size {}",
+                sample_size, self.sample_size
+            )));
+        }
+        let arr = batch_data.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
+            PyRuntimeError::new_err(
+                "coalesce.submit_batch: argument must be 2D NumPy array (float64)",
+            )
+        })?;
+        let shape = arr.shape();
+        if shape[0] != num_samples || shape[1] != sample_size {
+            return Err(PyRuntimeError::new_err(format!(
+                "coalesce.submit_batch: shape {:?} != (num_samples={}, sample_size={})",
+                shape, num_samples, sample_size
+            )));
+        }
+        for i in 0..num_samples {
+            let row = batch_data.get_item(i)?;
+            self.arrays.borrow_mut().push(row.clone().unbind());
+        }
+        Ok(())
+    }
+
+    /// Result after exiting the context: (QuantumTensor, boundaries). Raises if not yet flushed.
+    fn get_result(&self) -> PyResult<CoalesceResult> {
+        self.result.borrow_mut().take().ok_or_else(|| {
+            PyRuntimeError::new_err("coalesce: result not available (exit the 'with' block first)")
+        })
+    }
+}
 
 /// Helper to detect PyTorch tensor
 fn is_pytorch_tensor(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -462,6 +655,252 @@ impl QdpEngine {
         self.encode_from_list(data, num_qubits, encoding_method)
     }
 
+    /// Encode batch from raw bytes (float64, native/ little-endian order).
+    ///
+    /// For concurrent GPU submissions: pass `arr.tobytes()` so the heavy work
+    /// (interpret bytes as f64 + encode_batch) runs inside GIL release; the initial
+    /// bytes copy still holds GIL. Prefer encode_list for large batches when order allows.
+    #[pyo3(signature = (data, num_samples, sample_size, num_qubits, encoding_method="amplitude"))]
+    fn encode_batch_from_bytes(
+        &self,
+        data: &Bound<'_, PyAny>,
+        num_samples: usize,
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> PyResult<QuantumTensor> {
+        let py_bytes = data.cast::<PyBytes>().map_err(|_| {
+            PyRuntimeError::new_err(
+                "encode_batch_from_bytes: data must be bytes (e.g. arr.tobytes())",
+            )
+        })?;
+        let bytes_slice = py_bytes.as_bytes();
+        let len_bytes = bytes_slice.len();
+        if len_bytes % 8 != 0 {
+            return Err(PyRuntimeError::new_err(
+                "encode_batch_from_bytes: bytes length must be multiple of 8 (float64)",
+            ));
+        }
+        let n_f64 = len_bytes / 8;
+        if n_f64 != num_samples * sample_size {
+            return Err(PyRuntimeError::new_err(format!(
+                "encode_batch_from_bytes: bytes length {} ({} f64) != num_samples * sample_size ({} * {})",
+                len_bytes, n_f64, num_samples, sample_size
+            )));
+        }
+        // Owned copy so the detach closure is Send (no raw pointers).
+        let bytes_copy: Vec<u8> = bytes_slice.to_vec();
+        let enc = encoding_method.to_string();
+        let ptr_raw: usize = data.py().detach(|| {
+            let vec_f64: Vec<f64> = bytes_copy
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            self.engine
+                .encode_batch(
+                    vec_f64.as_slice(),
+                    num_samples,
+                    sample_size,
+                    num_qubits,
+                    enc.as_str(),
+                )
+                .map(|p| p as usize)
+                .map_err(|e| PyRuntimeError::new_err(format!("Encoding failed: {}", e)))
+        })?;
+        Ok(QuantumTensor {
+            ptr: ptr_raw as *mut _,
+            consumed: false,
+        })
+    }
+
+    /// Encode a list of arrays in one coalesced batch (one FFI, pipeline).
+    ///
+    /// Reduces FFI and Python object overhead vs N separate encode() calls (§3.9, §3.11.2).
+    /// Each array must be 1D float64 of length `sample_size`.
+    ///
+    /// Args:
+    ///     list_of_arrays: List of 1D NumPy arrays (float64), each of length sample_size
+    ///     sample_size: Number of elements per sample
+    ///     num_qubits: Number of qubits
+    ///     encoding_method: "amplitude", "angle", or "basis"
+    ///
+    /// Returns:
+    ///     Tuple of (QuantumTensor, boundaries). QuantumTensor is the merged batch (DLPack);
+    ///     boundaries is a list of (start_sample, num_samples), one (i, 1) per input array in order.
+    ///
+    /// Example:
+    ///     >>> engine = QdpEngine(0)
+    ///     >>> arrays = [np.random.randn(64).astype(np.float64) for _ in range(10)]
+    ///     >>> batch, boundaries = engine.encode_list(arrays, 64, 4, "amplitude")
+    ///     >>> len(boundaries) == 10
+    ///     True
+    ///
+    /// Scope-based coalescing (§3.4, §3.6): use `with engine.coalesce(...) as batcher:`
+    /// then `batcher.submit(array)` / `batcher.submit_batch(...)`; on exit, flush runs
+    /// and `batcher.get_result()` returns (QuantumTensor, boundaries).
+    #[pyo3(signature = (sample_size, num_qubits, encoding_method="amplitude"))]
+    fn coalesce(
+        slf: PyRef<'_, Self>,
+        _py: Python<'_>,
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> PyResult<CoalesceBatcher> {
+        // PyRef<'_, QdpEngine> -> Py<QdpEngine> (From), then -> Py<PyAny> (Into); see PyO3 0.27 types.
+        let engine_py: Py<QdpEngine> = slf.into();
+        Ok(CoalesceBatcher {
+            engine: engine_py.into(),
+            sample_size,
+            num_qubits,
+            encoding_method: encoding_method.to_string(),
+            arrays: RefCell::new(Vec::new()),
+            result: RefCell::new(None),
+        })
+    }
+
+    #[pyo3(signature = (list_of_arrays, sample_size, num_qubits, encoding_method="amplitude"))]
+    fn encode_list(
+        &self,
+        _py: Python<'_>,
+        list_of_arrays: &Bound<'_, PyAny>,
+        sample_size: usize,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> PyResult<(QuantumTensor, Vec<(usize, usize)>)> {
+        let list = list_of_arrays.cast::<PyList>().map_err(|_| {
+            PyRuntimeError::new_err(
+                "encode_list: argument must be a list of 1D NumPy arrays (float64)",
+            )
+        })?;
+        if list.len() == 0 {
+            return Err(PyRuntimeError::new_err(
+                "encode_list: list must not be empty",
+            ));
+        }
+        let mut arrays: Vec<PyReadonlyArray1<f64>> = Vec::with_capacity(list.len());
+        for (i, item) in list.iter().enumerate() {
+            let arr: PyReadonlyArray1<f64> =
+                item.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "encode_list: each item must be a 1D NumPy array with dtype float64",
+                    )
+                })?;
+            if arr.len() != sample_size {
+                return Err(PyRuntimeError::new_err(format!(
+                    "encode_list: array at index {} has length {}, expected sample_size {}",
+                    i,
+                    arr.len(),
+                    sample_size
+                )));
+            }
+            arrays.push(arr);
+        }
+        let mut refs: Vec<&[f64]> = Vec::with_capacity(arrays.len());
+        for a in &arrays {
+            refs.push(a.as_slice().map_err(|_| {
+                PyRuntimeError::new_err("encode_list: each array must be contiguous (C-order)")
+            })?);
+        }
+        let (ptr, boundaries) = self
+            .engine
+            .encode_list(&refs, sample_size, num_qubits, encoding_method)
+            .map_err(|e| PyRuntimeError::new_err(format!("Encoding failed: {}", e)))?;
+        Ok((
+            QuantumTensor {
+                ptr,
+                consumed: false,
+            },
+            boundaries,
+        ))
+    }
+
+    /// Submit encode task without blocking; returns a handle to retrieve result later (§3.9).
+    ///
+    /// Enables Dynamic Batching: submit multiple requests, then call `handle.get()` to receive
+    /// results in order. Scheduler coalesces tasks and runs pipeline once per batch.
+    ///
+    /// Args:
+    ///     data: Single sample - 1D NumPy array (float64) or list of floats; length must equal 2^num_qubits for amplitude encoding
+    ///     num_qubits: Number of qubits
+    ///     encoding_method: "amplitude", "angle", or "basis"
+    ///
+    /// Returns:
+    ///     EncodeHandle; call `.get()` to block and get QuantumTensor.
+    ///
+    /// Example:
+    ///     >>> engine = QdpEngine(0)
+    ///     >>> futures = [engine.encode_async(np.array([...], dtype=np.float64), 4, "amplitude") for _ in range(10)]
+    ///     >>> results = [f.get() for f in futures]
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (data, num_qubits, encoding_method="amplitude"))]
+    fn encode_async(
+        &self,
+        data: &Bound<'_, PyAny>,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> PyResult<EncodeHandle> {
+        let data_slice: Vec<f64> = if data.hasattr("__array_interface__")? {
+            let arr = data.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
+                PyRuntimeError::new_err(
+                    "encode_async: data must be 1D NumPy array with dtype float64",
+                )
+            })?;
+            arr.as_slice()
+                .map_err(|_| {
+                    PyRuntimeError::new_err("encode_async: array must be contiguous (C-order)")
+                })?
+                .to_vec()
+        } else {
+            data.extract::<Vec<f64>>().map_err(|_| {
+                PyRuntimeError::new_err(
+                    "encode_async: data must be 1D NumPy array (float64) or list of floats",
+                )
+            })?
+        };
+        let handle = self
+            .engine
+            .encode_async(&data_slice, num_qubits, encoding_method)
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))?;
+        Ok(EncodeHandle {
+            inner: Some(handle),
+        })
+    }
+
+    /// Submit one batch without blocking; returns BatchHandle. Call `.get()` to receive QuantumTensor.
+    /// Use for encode_stream: submit multiple batches so the Rust pool keeps the GPU fed, then get() in order.
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (data, num_qubits, encoding_method="amplitude"))]
+    fn encode_batch_submit(
+        &self,
+        data: &Bound<'_, PyAny>,
+        num_qubits: usize,
+        encoding_method: &str,
+    ) -> PyResult<BatchHandle> {
+        let array_2d = data.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
+            PyRuntimeError::new_err("encode_batch_submit: data must be 2D NumPy array (float64)")
+        })?;
+        let shape = array_2d.shape();
+        let num_samples = shape[0];
+        let sample_size = shape[1];
+        let data_slice = array_2d.as_slice().map_err(|_| {
+            PyRuntimeError::new_err("encode_batch_submit: array must be contiguous (C-order)")
+        })?;
+        // Zero-copy: pass slice to Rust; buffer must stay alive until handle.get() returns.
+        let handle = self
+            .engine
+            .encode_batch_submit(
+                data_slice,
+                num_samples,
+                sample_size,
+                num_qubits,
+                encoding_method,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))?;
+        Ok(BatchHandle {
+            inner: Some(handle),
+        })
+    }
+
     /// Encode from NumPy array (1D or 2D)
     fn encode_from_numpy(
         &self,
@@ -493,7 +932,8 @@ impl QdpEngine {
                 })
             }
             2 => {
-                // 2D array: batch encoding (zero-copy if already contiguous)
+                // 2D array: batch encoding. Zero-copy: pass slice to Rust (cudaHostRegister path).
+                // Caller keeps array alive for the duration of encode_batch (blocking).
                 let array_2d = data.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
                     PyRuntimeError::new_err(
                         "Failed to extract 2D NumPy array. Ensure dtype is float64.",
@@ -805,5 +1245,10 @@ fn _qdp(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<QdpEngine>()?;
     m.add_class::<QuantumTensor>()?;
+    m.add_class::<CoalesceBatcher>()?;
+    #[cfg(target_os = "linux")]
+    m.add_class::<EncodeHandle>()?;
+    #[cfg(target_os = "linux")]
+    m.add_class::<BatchHandle>()?;
     Ok(())
 }

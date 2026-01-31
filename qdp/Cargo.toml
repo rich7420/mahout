@@ -22,8 +22,8 @@ cudarc = { version = "0.13", features = ["cuda-12050"] }
 cc = "1.2"
 # Utilities (Rust 2024 Edition compatible)
 thiserror = "2.0"
-# Parallel computing (for CPU preprocessing)
-rayon = "1.10"
+# Parallel computing (for CPU preprocessing); 1.11 latest as of 2025
+rayon = "1.11"
 # Apache Arrow for columnar data format support
 arrow = "54"
 # Parquet support for Arrow

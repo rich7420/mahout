@@ -293,6 +293,94 @@ __global__ void amplitude_encode_batch_kernel(
     }
 }
 
+/// Fused kernel: L2 norm + amplitude encode per sample (one block per sample).
+/// Reduces kernel launch count from 2 to 1 per chunk (Part N.5).
+__global__ void amplitude_encode_batch_fused_kernel(
+    const double* __restrict__ input_batch,
+    cuDoubleComplex* __restrict__ state_batch,
+    size_t num_samples,
+    size_t input_len,
+    size_t state_len
+) {
+    const size_t sample_idx = blockIdx.x;
+    if (sample_idx >= num_samples) return;
+
+    const size_t base_in = sample_idx * input_len;
+    const size_t base_out = sample_idx * state_len;
+
+    // Phase 1: L2 reduction for this sample (grid-stride within block)
+    double local_sum = 0.0;
+    size_t vec_offset = threadIdx.x;
+    size_t offset = vec_offset * 2;
+    while (offset + 1 < input_len) {
+        const double2 v = __ldg(reinterpret_cast<const double2*>(input_batch + base_in) + vec_offset);
+        local_sum += v.x * v.x + v.y * v.y;
+        vec_offset += blockDim.x;
+        offset = vec_offset * 2;
+    }
+    if (offset < input_len) {
+        const double v = __ldg(input_batch + base_in + offset);
+        local_sum += v * v;
+    }
+
+    const double block_sum = block_reduce_sum(local_sum);
+    __shared__ double inv_norm_shared;
+    if (threadIdx.x == 0) {
+        inv_norm_shared = (block_sum > 0.0 && isfinite(block_sum)) ? rsqrt(block_sum) : 0.0;
+    }
+    __syncthreads();
+    const double inv_norm = inv_norm_shared;
+
+    // Phase 2: Amplitude encode (normalize and write state); one block per sample
+    const size_t elements_per_sample = state_len / 2;
+    const size_t total_work = elements_per_sample;
+    for (size_t idx = threadIdx.x; idx < total_work; idx += blockDim.x) {
+        const size_t elem_pair = idx;
+        const size_t elem_offset = elem_pair * 2;
+        double v1 = 0.0, v2 = 0.0;
+        if (elem_offset + 1 < input_len) {
+            const double2 vec_data = __ldg(reinterpret_cast<const double2*>(input_batch + base_in) + elem_pair);
+            v1 = vec_data.x;
+            v2 = vec_data.y;
+        } else if (elem_offset < input_len) {
+            v1 = __ldg(input_batch + base_in + elem_offset);
+        }
+        state_batch[base_out + elem_offset] = make_cuDoubleComplex(v1 * inv_norm, 0.0);
+        if (elem_offset + 1 < state_len) {
+            state_batch[base_out + elem_offset + 1] = make_cuDoubleComplex(v2 * inv_norm, 0.0);
+        }
+    }
+}
+
+/// Launch fused L2 norm + amplitude encode batch (one kernel per chunk).
+/// Replaces launch_l2_norm_batch + launch_amplitude_encode_batch (Part N.5).
+int launch_amplitude_encode_batch_fused(
+    const double* input_batch_d,
+    void* state_batch_d,
+    size_t num_samples,
+    size_t input_len,
+    size_t state_len,
+    cudaStream_t stream
+) {
+    if (num_samples == 0 || state_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    cuDoubleComplex* state_complex_d = static_cast<cuDoubleComplex*>(state_batch_d);
+    const int blockSize = DEFAULT_BLOCK_SIZE;
+    const size_t gridSize = num_samples;
+
+    amplitude_encode_batch_fused_kernel<<<gridSize, blockSize, 0, stream>>>(
+        input_batch_d,
+        state_complex_d,
+        num_samples,
+        input_len,
+        state_len
+    );
+
+    return (int)cudaGetLastError();
+}
+
 /// Launch optimized batch amplitude encoding kernel
 ///
 /// # Arguments

@@ -19,6 +19,7 @@
 use std::ffi::c_void;
 
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: u32 = 1;
+pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: u32 = 2;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 0x02;
 pub(crate) const CUDA_EVENT_DEFAULT: u32 = 0x00;
 
@@ -29,11 +30,23 @@ pub(crate) const CUDA_SUCCESS: i32 = 0;
 #[allow(dead_code)]
 pub(crate) const CUDA_ERROR_NOT_READY: i32 = 34;
 
+// cudaHostRegister flags: pin existing host memory for async DMA (zero-copy ingress).
+// Ref: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html
+#[allow(non_upper_case_globals)]
+pub(crate) const cudaHostRegisterDefault: u32 = 0;
+
 unsafe extern "C" {
     pub(crate) fn cudaHostAlloc(pHost: *mut *mut c_void, size: usize, flags: u32) -> i32;
     pub(crate) fn cudaFreeHost(ptr: *mut c_void) -> i32;
 
+    /// Pin existing host memory for async H2D (no copy to PinnedHostBuffer).
+    /// Call cudaHostUnregister(ptr) when done. Ref: Part M/N, CuPy #3450.
+    pub(crate) fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> i32;
+    pub(crate) fn cudaHostUnregister(ptr: *mut c_void) -> i32;
+
     pub(crate) fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+
+    pub(crate) fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: u32) -> i32;
 
     pub(crate) fn cudaMemcpyAsync(
         dst: *mut c_void,
@@ -47,7 +60,14 @@ unsafe extern "C" {
     pub(crate) fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> i32;
     pub(crate) fn cudaEventDestroy(event: *mut c_void) -> i32;
     pub(crate) fn cudaStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> i32;
+    #[allow(dead_code)]
     pub(crate) fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
+
+    /// Non-blocking stream query (N.6).
+    ///
+    /// Returns CUDA_SUCCESS if all operations in the stream have completed,
+    /// CUDA_ERROR_NOT_READY if not. Ref: CUDA §2.3.2.4 Stream Synchronization.
+    pub(crate) fn cudaStreamQuery(stream: *mut c_void) -> i32;
 
     pub(crate) fn cudaMemsetAsync(
         devPtr: *mut c_void,
@@ -77,4 +97,15 @@ unsafe extern "C" {
     /// Both events must have been created with CUDA_EVENT_DEFAULT flag.
     /// Reference: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html
     pub(crate) fn cudaEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> i32;
+
+    /// Query device attribute. Returns CUDA_SUCCESS (0) on success.
+    /// Reference: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html
+    pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
 }
+
+// Device attributes for compute capability (cudaDeviceAttr; keep CUDA naming).
+// Ref: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html (cudaDeviceAttr 75, 76)
+#[allow(non_upper_case_globals)]
+pub(crate) const cudaDevAttrComputeCapabilityMajor: i32 = 75;
+#[allow(non_upper_case_globals)]
+pub(crate) const cudaDevAttrComputeCapabilityMinor: i32 = 76;

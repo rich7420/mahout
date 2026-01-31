@@ -33,7 +33,10 @@ pub enum Precision {
 }
 
 #[cfg(target_os = "linux")]
-use crate::gpu::cuda_ffi::{cudaFreeHost, cudaHostAlloc, cudaMemGetInfo};
+use crate::gpu::cuda_ffi::{
+    cudaFreeHost, cudaHostAlloc, cudaHostRegister, cudaHostRegisterDefault, cudaHostUnregister,
+    cudaMemGetInfo,
+};
 
 #[cfg(target_os = "linux")]
 fn bytes_to_mib(bytes: usize) -> f64 {
@@ -303,6 +306,56 @@ impl GpuStateVector {
         self.size_elements
     }
 
+    /// Copy a contiguous range of samples from a batch to a new GpuStateVector (device-to-device).
+    /// Used when retrieving a single task's result from a coalesced batch (§3.9 encode_async).
+    #[cfg(target_os = "linux")]
+    pub fn copy_sample_range(
+        device: &Arc<CudaDevice>,
+        batch: &GpuStateVector,
+        start_sample: usize,
+        num_samples: usize,
+    ) -> Result<Self> {
+        use crate::gpu::cuda_ffi::{CUDA_MEMCPY_DEVICE_TO_DEVICE, cudaMemcpy};
+        let batch_samples = batch.num_samples.unwrap_or(1);
+        let single_elements = batch.size_elements / batch_samples;
+        let offset_elements = start_sample.checked_mul(single_elements).ok_or_else(|| {
+            MahoutError::InvalidInput("copy_sample_range: start_sample overflow".to_string())
+        })?;
+        let len_elements = num_samples.checked_mul(single_elements).ok_or_else(|| {
+            MahoutError::InvalidInput("copy_sample_range: num_samples overflow".to_string())
+        })?;
+        if offset_elements + len_elements > batch.size_elements {
+            return Err(MahoutError::InvalidInput(format!(
+                "copy_sample_range: range [{}, {}] out of batch size {}",
+                start_sample,
+                start_sample + num_samples,
+                batch_samples
+            )));
+        }
+        let out = if num_samples == 1 {
+            Self::new(device, batch.num_qubits)?
+        } else {
+            Self::new_batch(device, num_samples, batch.num_qubits)?
+        };
+        let bytes = len_elements
+            .checked_mul(std::mem::size_of::<CuDoubleComplex>())
+            .ok_or_else(|| {
+                MahoutError::InvalidInput("copy_sample_range: byte size overflow".to_string())
+            })?;
+        let offset_bytes = offset_elements * std::mem::size_of::<CuDoubleComplex>();
+        let src_ptr = unsafe { (batch.ptr_void() as *const u8).add(offset_bytes) as *const c_void };
+        unsafe {
+            let ret = cudaMemcpy(out.ptr_void(), src_ptr, bytes, CUDA_MEMCPY_DEVICE_TO_DEVICE);
+            if ret != 0 {
+                return Err(MahoutError::Cuda(format!(
+                    "copy_sample_range: cudaMemcpy D2D failed with error {}",
+                    ret
+                )));
+            }
+        }
+        Ok(out)
+    }
+
     /// Create GPU state vector for a batch of samples
     /// Allocates num_samples * 2^qubits complex numbers on GPU
     pub fn new_batch(_device: &Arc<CudaDevice>, num_samples: usize, qubits: usize) -> Result<Self> {
@@ -539,3 +592,82 @@ unsafe impl Send for PinnedHostBuffer {}
 
 #[cfg(target_os = "linux")]
 unsafe impl Sync for PinnedHostBuffer {}
+
+// === Registered Host Memory (zero-copy ingress) ===
+
+/// Pins existing host memory in place for async H2D. No copy; use for buffers from Python/NumPy.
+/// Caller must ensure the pointer remains valid until this is dropped. Unregisters on drop.
+/// Ref: Part M/N (cudaHostRegister), CuPy #3450.
+#[cfg(target_os = "linux")]
+pub struct RegisteredHostBuffer {
+    ptr: *const f64,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RegisteredHostBuffer {
+    /// Register the given host range for DMA. Caller must not free the memory until drop.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `ptr` is valid for reads of `len` contiguous `f64` elements,
+    /// and that the memory is not freed until the returned `RegisteredHostBuffer` is dropped.
+    pub unsafe fn new(ptr: *const f64, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Ok(Self { ptr, len });
+        }
+        let bytes = len.checked_mul(std::mem::size_of::<f64>()).ok_or_else(|| {
+            MahoutError::MemoryAllocation("RegisteredHostBuffer: len overflow".into())
+        })?;
+        let ret = unsafe { cudaHostRegister(ptr as *mut c_void, bytes, cudaHostRegisterDefault) };
+        if ret != 0 {
+            return Err(MahoutError::Cuda(format!(
+                "cudaHostRegister failed with error code {}",
+                ret
+            )));
+        }
+        Ok(Self { ptr, len })
+    }
+
+    /// Slice view of the registered region (valid until drop).
+    pub fn as_slice(&self) -> &[f64] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Raw pointer (for cache key comparison in batch_pool). R.1: skip re-register when same ptr/len.
+    pub fn ptr(&self) -> *const f64 {
+        self.ptr
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RegisteredHostBuffer {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        unsafe {
+            let result = cudaHostUnregister(self.ptr as *mut c_void);
+            if result != 0 {
+                eprintln!(
+                    "Warning: cudaHostUnregister failed with error code {}",
+                    result
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for RegisteredHostBuffer {}

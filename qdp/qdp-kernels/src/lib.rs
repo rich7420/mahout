@@ -98,6 +98,16 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Fused L2 norm + amplitude encode batch (one kernel per chunk). Part N.5.
+    pub fn launch_amplitude_encode_batch_fused(
+        input_batch_d: *const f64,
+        state_batch_d: *mut c_void,
+        num_samples: usize,
+        input_len: usize,
+        state_len: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// Launch L2 norm reduction (returns inverse norm)
     /// Returns CUDA error code (0 = success)
     ///
@@ -278,6 +288,19 @@ pub extern "C" fn launch_amplitude_encode_batch(
     _input_batch_d: *const f64,
     _state_batch_d: *mut c_void,
     _inv_norms_d: *const f64,
+    _num_samples: usize,
+    _input_len: usize,
+    _state_len: usize,
+    _stream: *mut c_void,
+) -> i32 {
+    999
+}
+
+#[cfg(any(not(target_os = "linux"), qdp_no_cuda))]
+#[unsafe(no_mangle)]
+pub extern "C" fn launch_amplitude_encode_batch_fused(
+    _input_batch_d: *const f64,
+    _state_batch_d: *mut c_void,
     _num_samples: usize,
     _input_len: usize,
     _state_len: usize,

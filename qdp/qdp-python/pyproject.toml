@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "qumat-qdp"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
-dependencies = ["qumat>0.4.0"]
+dependencies = ["numpy>=1.24,<2.0", "qumat>0.4.0"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -38,4 +38,4 @@ url = "https://download.pytorch.org/whl/cu122"
 explicit = true
 
 [tool.maturin]
-module-name = "_qdp"
+module-name = "qumat_qdp._qdp"
