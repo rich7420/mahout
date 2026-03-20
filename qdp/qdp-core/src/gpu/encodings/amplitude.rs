@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use super::QuantumEncoder;
+use super::{PoolRef, QuantumEncoder};
 #[cfg(target_os = "linux")]
 use crate::error::cuda_error_to_string;
 use crate::error::{MahoutError, Result};
@@ -60,6 +60,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         _device: &Arc<CudaDevice>,
         host_data: &[f64],
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         // Validate qubits using Preprocessor (which uses validate_qubit_count internally)
         Preprocessor::validate_input(host_data, num_qubits)?;
@@ -70,7 +71,7 @@ impl QuantumEncoder for AmplitudeEncoder {
             // Allocate GPU state vector
             let state_vector = {
                 crate::profile_scope!("GPU::Alloc");
-                GpuStateVector::new(_device, num_qubits, Precision::Float64)?
+                GpuStateVector::new_from_pool(_device, num_qubits, Precision::Float64, pool)?
             };
 
             // Async Pipeline for large data
@@ -157,9 +158,10 @@ impl QuantumEncoder for AmplitudeEncoder {
 
                 {
                     crate::profile_scope!("GPU::Synchronize");
-                    _device.synchronize().map_err(|e| {
-                        MahoutError::Cuda(format!("CUDA device synchronize failed: {:?}", e))
-                    })?;
+                    crate::gpu::cuda_sync::sync_cuda_stream(
+                        std::ptr::null_mut(),
+                        "Amplitude encode stream synchronize failed",
+                    )?;
                 }
             } else {
                 // Async Pipeline path for large data
@@ -195,6 +197,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         num_samples: usize,
         sample_size: usize,
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         crate::profile_scope!("AmplitudeEncoder::encode_batch");
 
@@ -206,7 +209,13 @@ impl QuantumEncoder for AmplitudeEncoder {
         // Allocate single large GPU buffer for all states
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
 
         // Upload input data to GPU
@@ -307,6 +316,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         input_len: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         let state_len = 1 << num_qubits;
         if input_len == 0 {
@@ -323,7 +333,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         let input_d = input_d as *const f64;
         let state_vector = {
             crate::profile_scope!("GPU::Alloc");
-            GpuStateVector::new(device, num_qubits, Precision::Float64)?
+            GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
         };
         let inv_norm = {
             crate::profile_scope!("GPU::NormFromPtr");
@@ -370,6 +380,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         sample_size: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         let state_len = 1 << num_qubits;
         if sample_size == 0 {
@@ -386,7 +397,13 @@ impl QuantumEncoder for AmplitudeEncoder {
         let input_batch_d = input_batch_d as *const f64;
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
         let inv_norms_gpu = {
             crate::profile_scope!("GPU::BatchNormKernel");
@@ -533,6 +550,7 @@ impl AmplitudeEncoder {
 
                 Ok(())
             },
+            None, // No persistent context in internal helper
         )?;
 
         // CRITICAL FIX: Handle padding for uninitialized memory
@@ -853,7 +871,8 @@ impl AmplitudeEncoder {
     ) -> Result<()> {
         Preprocessor::validate_input(host_data, num_qubits)?;
         let state_len = 1 << num_qubits;
-        let state_vector = GpuStateVector::new(device, num_qubits, Precision::Float64)?;
+        let state_vector =
+            GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, None)?;
         let norm = Preprocessor::calculate_l2_norm(host_data)?;
         let inv_norm = 1.0 / norm;
         Self::encode_async_pipeline(

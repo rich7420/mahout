@@ -351,10 +351,10 @@ pub(crate) fn stream_encode<E: ChunkEncoder>(
     // Defuse guard for explicit cleanup with proper error handling
     let io_handle = cleanup_guard.defuse();
 
-    engine
-        .device
-        .synchronize()
-        .map_err(|e| MahoutError::Cuda(format!("{:?}", e)))?;
+    crate::gpu::cuda_sync::sync_cuda_stream(
+        std::ptr::null_mut(),
+        "stream_encode final synchronize failed",
+    )?;
     io_handle
         .join()
         .map_err(|e| MahoutError::Io(format!("IO thread panicked: {:?}", e)))?;

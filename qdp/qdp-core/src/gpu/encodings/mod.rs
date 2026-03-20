@@ -25,6 +25,9 @@ use cudarc::driver::CudaDevice;
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
 
+#[cfg(target_os = "linux")]
+use crate::gpu::device_pool::DeviceBufferPool;
+
 /// Maximum number of qubits supported (16GB GPU memory limit)
 /// This constant must match MAX_QUBITS in qdp-kernels/src/kernel_config.h
 pub const MAX_QUBITS: usize = 30;
@@ -56,6 +59,12 @@ pub fn validate_qubit_count(num_qubits: usize) -> Result<()> {
     Ok(())
 }
 
+/// Pool reference type alias (None on non-Linux targets).
+#[cfg(target_os = "linux")]
+pub type PoolRef<'a> = Option<&'a Arc<DeviceBufferPool>>;
+#[cfg(not(target_os = "linux"))]
+pub type PoolRef<'a> = Option<&'a ()>;
+
 /// Quantum encoding strategy interface
 /// Implemented by: AmplitudeEncoder, AngleEncoder, BasisEncoder
 pub trait QuantumEncoder: Send + Sync {
@@ -65,6 +74,7 @@ pub trait QuantumEncoder: Send + Sync {
         device: &Arc<CudaDevice>,
         data: &[f64],
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector>;
 
     /// Encode multiple samples in a single GPU allocation and kernel launch (Batch Encoding)
@@ -75,6 +85,7 @@ pub trait QuantumEncoder: Send + Sync {
         _num_samples: usize,
         _sample_size: usize,
         _num_qubits: usize,
+        _pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         Err(crate::error::MahoutError::NotImplemented(format!(
             "Batch encoding not implemented for {}",
@@ -106,6 +117,7 @@ pub trait QuantumEncoder: Send + Sync {
         _input_len: usize,
         _num_qubits: usize,
         _stream: *mut c_void,
+        _pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         Err(MahoutError::NotImplemented(format!(
             "encode_from_gpu_ptr not supported for {}",
@@ -120,6 +132,7 @@ pub trait QuantumEncoder: Send + Sync {
     /// `num_samples * sample_size` elements of the expected dtype on the same device as `device`,
     /// and `stream` is a valid CUDA stream or null.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn encode_batch_from_gpu_ptr(
         &self,
         _device: &Arc<CudaDevice>,
@@ -128,6 +141,7 @@ pub trait QuantumEncoder: Send + Sync {
         _sample_size: usize,
         _num_qubits: usize,
         _stream: *mut c_void,
+        _pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         Err(MahoutError::NotImplemented(format!(
             "encode_batch_from_gpu_ptr not supported for {}",

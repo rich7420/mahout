@@ -20,7 +20,7 @@
 // The compiler can't statically determine which path is taken.
 #![allow(unused_unsafe)]
 
-use super::{QuantumEncoder, validate_qubit_count};
+use super::{PoolRef, QuantumEncoder, validate_qubit_count};
 #[cfg(target_os = "linux")]
 use crate::error::cuda_error_to_string;
 use crate::error::{MahoutError, Result};
@@ -47,6 +47,7 @@ impl QuantumEncoder for AngleEncoder {
         #[cfg(not(target_os = "linux"))] _device: &Arc<CudaDevice>,
         data: &[f64],
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         self.validate_input(data, num_qubits)?;
         let state_len = 1 << num_qubits;
@@ -63,7 +64,7 @@ impl QuantumEncoder for AngleEncoder {
 
             let state_vector = {
                 crate::profile_scope!("GPU::Alloc");
-                GpuStateVector::new(device, num_qubits, Precision::Float64)?
+                GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
             };
 
             let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
@@ -95,9 +96,10 @@ impl QuantumEncoder for AngleEncoder {
 
             {
                 crate::profile_scope!("GPU::Synchronize");
-                device.synchronize().map_err(|e| {
-                    MahoutError::Cuda(format!("CUDA device synchronize failed: {:?}", e))
-                })?;
+                crate::gpu::cuda_sync::sync_cuda_stream(
+                    std::ptr::null_mut(),
+                    "Angle encode stream synchronize failed",
+                )?;
             }
 
             Ok(state_vector)
@@ -120,6 +122,7 @@ impl QuantumEncoder for AngleEncoder {
         num_samples: usize,
         sample_size: usize,
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         crate::profile_scope!("AngleEncoder::encode_batch");
 
@@ -168,7 +171,13 @@ impl QuantumEncoder for AngleEncoder {
 
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
 
         let input_bytes = std::mem::size_of_val(batch_data);
@@ -209,9 +218,10 @@ impl QuantumEncoder for AngleEncoder {
 
         {
             crate::profile_scope!("GPU::Synchronize");
-            device
-                .synchronize()
-                .map_err(|e| MahoutError::Cuda(format!("Sync failed: {:?}", e)))?;
+            crate::gpu::cuda_sync::sync_cuda_stream(
+                std::ptr::null_mut(),
+                "Angle batch encode stream synchronize failed",
+            )?;
         }
 
         Ok(batch_state_vector)
@@ -225,6 +235,7 @@ impl QuantumEncoder for AngleEncoder {
         input_len: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if input_len != num_qubits {
             return Err(MahoutError::InvalidInput(format!(
@@ -236,7 +247,7 @@ impl QuantumEncoder for AngleEncoder {
         let angles_d = input_d as *const f64;
         let state_vector = {
             crate::profile_scope!("GPU::Alloc");
-            GpuStateVector::new(device, num_qubits, Precision::Float64)?
+            GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
         };
         let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
             MahoutError::InvalidInput(
@@ -278,6 +289,7 @@ impl QuantumEncoder for AngleEncoder {
         sample_size: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if sample_size == 0 {
             return Err(MahoutError::InvalidInput(
@@ -337,7 +349,13 @@ impl QuantumEncoder for AngleEncoder {
         }
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
         let state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {
             MahoutError::InvalidInput(
@@ -412,7 +430,13 @@ impl AngleEncoder {
     ) -> Result<GpuStateVector> {
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                None,
+            )?
         };
 
         let state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {

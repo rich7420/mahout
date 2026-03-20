@@ -51,6 +51,15 @@ pub struct PipelineContext {
     events_copy_done: Vec<*mut c_void>,
 }
 
+// Safety: CUDA streams and events can be used from any thread as long as
+// access is properly synchronized. PipelineContext is guarded by Mutex when
+// stored in QdpEngine, ensuring exclusive access. This matches the GpuStateVector
+// pattern in memory.rs.
+#[cfg(target_os = "linux")]
+unsafe impl Send for PipelineContext {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for PipelineContext {}
+
 #[cfg(target_os = "linux")]
 fn validate_event_slot(events: &[*mut c_void], slot: usize) -> Result<()> {
     if slot >= events.len() {
@@ -254,6 +263,7 @@ pub fn run_dual_stream_pipeline<F>(
     device: &Arc<CudaDevice>,
     host_data: &[f64],
     kernel_launcher: F,
+    external_ctx: Option<&PipelineContext>,
 ) -> Result<()>
 where
     F: FnMut(&CudaStream, *const f64, usize, usize) -> Result<()>,
@@ -266,6 +276,7 @@ where
         host_data,
         CHUNK_SIZE_ELEMENTS,
         kernel_launcher,
+        external_ctx,
     )
 }
 
@@ -310,6 +321,7 @@ where
         host_data,
         chunk_size_elements,
         kernel_launcher,
+        None, // aligned pipeline doesn't use persistent context yet
     )
 }
 
@@ -319,6 +331,7 @@ fn run_dual_stream_pipeline_with_chunk_size<F>(
     host_data: &[f64],
     chunk_size_elements: usize,
     mut kernel_launcher: F,
+    external_ctx: Option<&PipelineContext>,
 ) -> Result<()>
 where
     F: FnMut(&CudaStream, *const f64, usize, usize) -> Result<()>,
@@ -340,8 +353,15 @@ where
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // 1. Create dual streams with per-slot events to coordinate copy -> compute
-    let ctx = PipelineContext::new(device, PINNED_POOL_SIZE)?;
+    // 1. Reuse external context if provided, otherwise create fresh streams+events.
+    let owned_ctx;
+    let ctx = match external_ctx {
+        Some(c) => c,
+        None => {
+            owned_ctx = PipelineContext::new(device, PINNED_POOL_SIZE)?;
+            &owned_ctx
+        }
+    };
     let pinned_pool = PinnedBufferPool::new(PINNED_POOL_SIZE, chunk_size_elements)
         .map_err(|e| MahoutError::Cuda(format!("Failed to create pinned buffer pool: {}", e)))?;
 

@@ -16,7 +16,7 @@
 
 // IQP (Instantaneous Quantum Polynomial) encoding: entangled quantum states via diagonal phases.
 
-use super::QuantumEncoder;
+use super::{PoolRef, QuantumEncoder};
 #[cfg(target_os = "linux")]
 use crate::error::cuda_error_to_string;
 use crate::error::{MahoutError, Result};
@@ -72,6 +72,7 @@ impl QuantumEncoder for IqpEncoder {
         #[cfg(not(target_os = "linux"))] _device: &Arc<CudaDevice>,
         data: &[f64],
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         self.validate_input(data, num_qubits)?;
         let state_len = 1 << num_qubits;
@@ -88,7 +89,7 @@ impl QuantumEncoder for IqpEncoder {
 
             let state_vector = {
                 crate::profile_scope!("GPU::Alloc");
-                GpuStateVector::new(device, num_qubits, Precision::Float64)?
+                GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
             };
 
             let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
@@ -121,9 +122,10 @@ impl QuantumEncoder for IqpEncoder {
 
             {
                 crate::profile_scope!("GPU::Synchronize");
-                device.synchronize().map_err(|e| {
-                    MahoutError::Cuda(format!("CUDA device synchronize failed: {:?}", e))
-                })?;
+                crate::gpu::cuda_sync::sync_cuda_stream(
+                    std::ptr::null_mut(),
+                    "IQP encode stream synchronize failed",
+                )?;
             }
 
             Ok(state_vector)
@@ -146,6 +148,7 @@ impl QuantumEncoder for IqpEncoder {
         num_samples: usize,
         sample_size: usize,
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         crate::profile_scope!("IqpEncoder::encode_batch");
 
@@ -191,7 +194,13 @@ impl QuantumEncoder for IqpEncoder {
 
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
 
         let input_bytes = std::mem::size_of_val(batch_data);
@@ -234,9 +243,10 @@ impl QuantumEncoder for IqpEncoder {
 
         {
             crate::profile_scope!("GPU::Synchronize");
-            device
-                .synchronize()
-                .map_err(|e| MahoutError::Cuda(format!("Sync failed: {:?}", e)))?;
+            crate::gpu::cuda_sync::sync_cuda_stream(
+                std::ptr::null_mut(),
+                "IQP batch encode stream synchronize failed",
+            )?;
         }
 
         Ok(batch_state_vector)
@@ -250,6 +260,7 @@ impl QuantumEncoder for IqpEncoder {
         input_len: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if num_qubits == 0 || num_qubits > 30 {
             return Err(MahoutError::InvalidInput(format!(
@@ -272,7 +283,7 @@ impl QuantumEncoder for IqpEncoder {
         let state_len = 1 << num_qubits;
         let state_vector = {
             crate::profile_scope!("GPU::Alloc");
-            GpuStateVector::new(device, num_qubits, Precision::Float64)?
+            GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
         };
 
         let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
@@ -320,6 +331,7 @@ impl QuantumEncoder for IqpEncoder {
         sample_size: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if num_qubits == 0 || num_qubits > 30 {
             return Err(MahoutError::InvalidInput(format!(
@@ -342,7 +354,13 @@ impl QuantumEncoder for IqpEncoder {
         let state_len = 1 << num_qubits;
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
 
         let state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {

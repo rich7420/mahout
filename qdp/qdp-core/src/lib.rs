@@ -113,6 +113,9 @@ fn validate_cuda_input_ptr(device: &CudaDevice, ptr: *const c_void) -> Result<()
 pub struct QdpEngine {
     device: Arc<CudaDevice>,
     precision: Precision,
+    /// Optional GPU memory pool for buffer reuse (avoids cudaMalloc/cudaFree per encode).
+    #[cfg(target_os = "linux")]
+    pub(crate) device_pool: Option<Arc<gpu::DeviceBufferPool>>,
 }
 
 impl QdpEngine {
@@ -132,9 +135,22 @@ impl QdpEngine {
                 device_id, e
             ))
         })?;
+
+        #[cfg(target_os = "linux")]
+        let device_pool = {
+            // Default: cache up to 32 buffers to avoid cudaMalloc/cudaFree churn
+            const DEFAULT_MAX_CACHED: usize = 32;
+            Some(Arc::new(gpu::DeviceBufferPool::new(
+                Arc::clone(&device),
+                DEFAULT_MAX_CACHED,
+            )))
+        };
+
         Ok(Self {
-            device, // CudaDevice::new already returns Arc<CudaDevice> in cudarc 0.11
+            device,
             precision,
+            #[cfg(target_os = "linux")]
+            device_pool,
         })
     }
 
@@ -161,7 +177,8 @@ impl QdpEngine {
         crate::profile_scope!("Mahout::Encode");
 
         let encoder = get_encoder(encoding_method)?;
-        let state_vector = encoder.encode(&self.device, data, num_qubits)?;
+        let state_vector =
+            encoder.encode(&self.device, data, num_qubits, self.device_pool.as_ref())?;
         let state_vector = state_vector.to_precision(&self.device, self.precision)?;
         let dlpack_ptr = {
             crate::profile_scope!("DLPack::Wrap");
@@ -215,6 +232,7 @@ impl QdpEngine {
             num_samples,
             sample_size,
             num_qubits,
+            self.device_pool.as_ref(),
         )?;
 
         let state_vector = state_vector.to_precision(&self.device, self.precision)?;
@@ -484,7 +502,14 @@ impl QdpEngine {
 
         let encoder = get_encoder(encoding_method)?;
         let state_vector = unsafe {
-            encoder.encode_from_gpu_ptr(&self.device, input_d, input_len, num_qubits, stream)
+            encoder.encode_from_gpu_ptr(
+                &self.device,
+                input_d,
+                input_len,
+                num_qubits,
+                stream,
+                self.device_pool.as_ref(),
+            )
         }?;
         let state_vector = state_vector.to_precision(&self.device, self.precision)?;
         Ok(state_vector.to_dlpack())
@@ -562,7 +587,12 @@ impl QdpEngine {
 
         let state_vector = {
             crate::profile_scope!("GPU::Alloc");
-            gpu::GpuStateVector::new(&self.device, num_qubits, Precision::Float32)?
+            gpu::GpuStateVector::new_from_pool(
+                &self.device,
+                num_qubits,
+                Precision::Float32,
+                self.device_pool.as_ref(),
+            )?
         };
 
         let inv_norm = {
@@ -768,6 +798,7 @@ impl QdpEngine {
                 sample_size,
                 num_qubits,
                 stream,
+                self.device_pool.as_ref(),
             )
         }?;
         let batch_state_vector = batch_state_vector.to_precision(&self.device, self.precision)?;

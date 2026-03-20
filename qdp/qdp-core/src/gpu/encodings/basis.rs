@@ -20,7 +20,7 @@
 // The compiler can't statically determine which path is taken.
 #![allow(unused_unsafe)]
 
-use super::{QuantumEncoder, validate_qubit_count};
+use super::{PoolRef, QuantumEncoder, validate_qubit_count};
 #[cfg(target_os = "linux")]
 use crate::error::cuda_error_to_string;
 use crate::error::{MahoutError, Result};
@@ -55,6 +55,7 @@ impl QuantumEncoder for BasisEncoder {
         #[cfg(not(target_os = "linux"))] _device: &Arc<CudaDevice>,
         data: &[f64],
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         // Validate basic input constraints
         self.validate_input(data, num_qubits)?;
@@ -76,7 +77,7 @@ impl QuantumEncoder for BasisEncoder {
             // Allocate GPU state vector
             let state_vector = {
                 crate::profile_scope!("GPU::Alloc");
-                GpuStateVector::new(device, num_qubits, Precision::Float64)?
+                GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
             };
 
             let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
@@ -108,9 +109,10 @@ impl QuantumEncoder for BasisEncoder {
 
             {
                 crate::profile_scope!("GPU::Synchronize");
-                device.synchronize().map_err(|e| {
-                    MahoutError::Cuda(format!("CUDA device synchronize failed: {:?}", e))
-                })?;
+                crate::gpu::cuda_sync::sync_cuda_stream(
+                    std::ptr::null_mut(),
+                    "Basis encode stream synchronize failed",
+                )?;
             }
 
             Ok(state_vector)
@@ -133,6 +135,7 @@ impl QuantumEncoder for BasisEncoder {
         num_samples: usize,
         sample_size: usize,
         num_qubits: usize,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         crate::profile_scope!("BasisEncoder::encode_batch");
 
@@ -169,7 +172,13 @@ impl QuantumEncoder for BasisEncoder {
         // Allocate batch state vector
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
 
         // Upload basis indices to GPU
@@ -217,9 +226,10 @@ impl QuantumEncoder for BasisEncoder {
         // Synchronize
         {
             crate::profile_scope!("GPU::Synchronize");
-            device
-                .synchronize()
-                .map_err(|e| MahoutError::Cuda(format!("Sync failed: {:?}", e)))?;
+            crate::gpu::cuda_sync::sync_cuda_stream(
+                std::ptr::null_mut(),
+                "Basis batch encode stream synchronize failed",
+            )?;
         }
 
         Ok(batch_state_vector)
@@ -233,6 +243,7 @@ impl QuantumEncoder for BasisEncoder {
         input_len: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if input_len != 1 {
             return Err(MahoutError::InvalidInput(format!(
@@ -244,7 +255,7 @@ impl QuantumEncoder for BasisEncoder {
         let basis_indices_d = input_d as *const usize;
         let state_vector = {
             crate::profile_scope!("GPU::Alloc");
-            GpuStateVector::new(device, num_qubits, Precision::Float64)?
+            GpuStateVector::new_from_pool(device, num_qubits, Precision::Float64, pool)?
         };
         let state_ptr = state_vector.ptr_f64().ok_or_else(|| {
             MahoutError::InvalidInput(
@@ -287,6 +298,7 @@ impl QuantumEncoder for BasisEncoder {
         sample_size: usize,
         num_qubits: usize,
         stream: *mut c_void,
+        pool: PoolRef<'_>,
     ) -> Result<GpuStateVector> {
         if sample_size != 1 {
             return Err(MahoutError::InvalidInput(format!(
@@ -298,7 +310,13 @@ impl QuantumEncoder for BasisEncoder {
         let basis_indices_d = input_batch_d as *const usize;
         let batch_state_vector = {
             crate::profile_scope!("GPU::AllocBatch");
-            GpuStateVector::new_batch(device, num_samples, num_qubits, Precision::Float64)?
+            GpuStateVector::new_batch_from_pool(
+                device,
+                num_samples,
+                num_qubits,
+                Precision::Float64,
+                pool,
+            )?
         };
         let state_ptr = batch_state_vector.ptr_f64().ok_or_else(|| {
             MahoutError::InvalidInput(

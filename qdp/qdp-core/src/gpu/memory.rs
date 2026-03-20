@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::error::cuda_error_to_string;
 
 /// Precision of the GPU state vector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Precision {
     Float32,
     Float64,
@@ -168,7 +168,7 @@ pub enum BufferStorage {
 }
 
 impl BufferStorage {
-    fn precision(&self) -> Precision {
+    pub(crate) fn precision(&self) -> Precision {
         match self {
             BufferStorage::F32(_) => Precision::Float32,
             BufferStorage::F64(_) => Precision::Float64,
@@ -202,7 +202,12 @@ impl BufferStorage {
 /// Manages complex array of size 2^n (n = qubits) in GPU memory.
 /// Uses Arc for shared ownership (needed for DLPack/PyTorch integration).
 /// Thread-safe: Send + Sync
-#[derive(Clone)]
+///
+/// Pool-aware: if created via `new_from_pool()`, the buffer is returned to the
+/// `DeviceBufferPool` on drop instead of being freed via `cudaFree`. This only
+/// happens when this is the last Rust owner (Arc strong_count == 1). DLPack
+/// export increments the Arc refcount, preventing pool return — the DLPack
+/// deleter handles cleanup instead.
 pub struct GpuStateVector {
     // Use Arc to allow DLPack to share ownership
     pub(crate) buffer: Arc<BufferStorage>,
@@ -212,11 +217,55 @@ pub struct GpuStateVector {
     pub(crate) num_samples: Option<usize>,
     /// CUDA device ordinal
     pub device_id: usize,
+    /// Pool reference for returning the buffer on drop (None = standard cudaFree).
+    #[cfg(target_os = "linux")]
+    pool_return: Option<Arc<super::device_pool::DeviceBufferPool>>,
 }
 
 // Safety: CudaSlice and Arc are both Send + Sync
 unsafe impl Send for GpuStateVector {}
 unsafe impl Sync for GpuStateVector {}
+
+impl Clone for GpuStateVector {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: Arc::clone(&self.buffer),
+            num_qubits: self.num_qubits,
+            size_elements: self.size_elements,
+            num_samples: self.num_samples,
+            device_id: self.device_id,
+            // Clones do NOT return buffers to pool — only the original owner does.
+            #[cfg(target_os = "linux")]
+            pool_return: None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuStateVector {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool_return.take() {
+            // Only return to pool if we're the sole Arc owner (strong_count == 1).
+            // If DLPack or other clones hold references, just let Arc decrement normally.
+            if Arc::strong_count(&self.buffer) == 1
+                && let Some(inner) = Arc::get_mut(&mut self.buffer)
+            {
+                let precision = inner.precision();
+                let size = self.size_elements;
+                // Take ownership by swapping with a same-precision buffer from the pool
+                // (the pool may have a spare). If the pool has a spare, we swap it in
+                // as the dummy and return our buffer. Otherwise, let cudaFree handle it.
+                if let Ok(spare) = pool.acquire(1, precision) {
+                    let real_buffer = std::mem::replace(inner, spare);
+                    pool.release(real_buffer, size);
+                    // `spare` (now in self.buffer) will be dropped normally (cudaFree).
+                }
+                // If no spare available, just let the buffer drop via cudaFree.
+                // The pool still provides value on the acquire() side.
+            }
+        }
+    }
+}
 
 impl GpuStateVector {
     /// Create GPU state vector for n qubits with the given precision.
@@ -290,6 +339,8 @@ impl GpuStateVector {
             size_elements: _size_elements,
             num_samples: None,
             device_id: _device.ordinal(),
+            #[cfg(target_os = "linux")]
+            pool_return: None,
         })
     }
 
@@ -299,6 +350,72 @@ impl GpuStateVector {
             "CUDA is only available on Linux. This build does not support GPU operations."
                 .to_string(),
         ))
+    }
+
+    /// Create GPU state vector using the pool for buffer reuse.
+    ///
+    /// If a matching buffer exists in the pool, it is reused (avoiding cudaMalloc).
+    /// Otherwise, a new buffer is allocated. If no pool is provided, falls back to
+    /// the standard allocation path.
+    ///
+    /// The returned `GpuStateVector` will return its buffer to the pool on drop
+    /// (if it is the last Rust owner).
+    #[cfg(target_os = "linux")]
+    pub fn new_from_pool(
+        device: &Arc<CudaDevice>,
+        qubits: usize,
+        precision: Precision,
+        pool: Option<&Arc<super::device_pool::DeviceBufferPool>>,
+    ) -> Result<Self> {
+        let size_elements: usize = 1usize << qubits;
+
+        let pool_arc = match pool {
+            Some(p) => p,
+            None => return Self::new(device, qubits, precision),
+        };
+        let buffer = pool_arc.acquire(size_elements, precision)?;
+
+        Ok(Self {
+            buffer: Arc::new(buffer),
+            num_qubits: qubits,
+            size_elements,
+            num_samples: None,
+            device_id: device.ordinal(),
+            pool_return: Some(Arc::clone(pool_arc)),
+        })
+    }
+
+    /// Create batch GPU state vector using the pool for buffer reuse.
+    #[cfg(target_os = "linux")]
+    pub fn new_batch_from_pool(
+        device: &Arc<CudaDevice>,
+        num_samples: usize,
+        qubits: usize,
+        precision: Precision,
+        pool: Option<&Arc<super::device_pool::DeviceBufferPool>>,
+    ) -> Result<Self> {
+        let single_state_size: usize = 1usize << qubits;
+        let total_elements = num_samples.checked_mul(single_state_size).ok_or_else(|| {
+            MahoutError::MemoryAllocation(format!(
+                "Batch size overflow: {} samples * {} elements",
+                num_samples, single_state_size
+            ))
+        })?;
+
+        let pool_arc = match pool {
+            Some(p) => p,
+            None => return Self::new_batch(device, num_samples, qubits, precision),
+        };
+        let buffer = pool_arc.acquire(total_elements, precision)?;
+
+        Ok(Self {
+            buffer: Arc::new(buffer),
+            num_qubits: qubits,
+            size_elements: total_elements,
+            num_samples: Some(num_samples),
+            device_id: device.ordinal(),
+            pool_return: Some(Arc::clone(pool_arc)),
+        })
     }
 
     /// Get current precision of the underlying buffer.
@@ -401,6 +518,7 @@ impl GpuStateVector {
                 size_elements: total_elements,
                 num_samples: Some(num_samples),
                 device_id: _device.ordinal(),
+                pool_return: None,
             })
         }
 
@@ -474,12 +592,10 @@ impl GpuStateVector {
                         )));
                     }
 
-                    device.synchronize().map_err(|e| {
-                        MahoutError::Cuda(format!(
-                            "Failed to sync after precision conversion: {:?}",
-                            e
-                        ))
-                    })?;
+                    crate::gpu::cuda_sync::sync_cuda_stream(
+                        std::ptr::null_mut(),
+                        "Precision conversion (f32→f64) stream synchronize failed",
+                    )?;
 
                     Ok(Self {
                         buffer: Arc::new(BufferStorage::F64(GpuBufferRaw { slice })),
@@ -487,6 +603,7 @@ impl GpuStateVector {
                         size_elements: self.size_elements,
                         num_samples: self.num_samples,
                         device_id: device.ordinal(),
+                        pool_return: None,
                     })
                 }
 
@@ -549,12 +666,10 @@ impl GpuStateVector {
                         )));
                     }
 
-                    device.synchronize().map_err(|e| {
-                        MahoutError::Cuda(format!(
-                            "Failed to sync after precision conversion: {:?}",
-                            e
-                        ))
-                    })?;
+                    crate::gpu::cuda_sync::sync_cuda_stream(
+                        std::ptr::null_mut(),
+                        "Precision conversion (f64→f32) stream synchronize failed",
+                    )?;
 
                     Ok(Self {
                         buffer: Arc::new(BufferStorage::F32(GpuBufferRaw { slice })),
@@ -562,6 +677,7 @@ impl GpuStateVector {
                         size_elements: self.size_elements,
                         num_samples: self.num_samples, // Preserve batch information
                         device_id: device.ordinal(),
+                        pool_return: None,
                     })
                 }
 
