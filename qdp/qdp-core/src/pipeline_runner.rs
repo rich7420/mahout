@@ -388,36 +388,12 @@ impl PipelineIterator {
                     ))
                 }
             }
-            DataSource::InMemory {
-                data,
-                cursor,
-                sample_size,
-                batches_yielded,
-                batch_limit,
-                ..
-            } => {
-                if *batches_yielded >= *batch_limit {
-                    None
-                } else {
-                    let remaining = (data.len() - *cursor) / *sample_size;
-                    if remaining == 0 {
-                        None
-                    } else {
-                        let batch_n = remaining.min(self.config.batch_size);
-                        let start = *cursor;
-                        let end = start + batch_n * *sample_size;
-                        *cursor = end;
-                        *batches_yielded += 1;
-                        let slice = data[start..end].to_vec();
-                        Some((
-                            slice,
-                            batch_n,
-                            *sample_size,
-                            self.config.num_qubits as usize,
-                        ))
-                    }
-                }
-            }
+            // InMemory is handled directly by next_batch() via zero-copy &data[start..end];
+            // take_batch_from_source() is only called from the Synthetic/Streaming path.
+            DataSource::InMemory { .. } => unreachable!(
+                "InMemory batches are served by next_batch() directly (zero-copy); \
+                 take_batch_from_source() should not be called for InMemory"
+            ),
             DataSource::Streaming {
                 reader,
                 buffer,
